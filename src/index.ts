@@ -8,7 +8,7 @@
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-import { FirecrawlAuthResolver } from "./core/auth.ts";
+import { FirecrawlAuthResolver, NO_KEY_HINT } from "./core/auth.ts";
 import { FirecrawlClient } from "./core/client.ts";
 import { loadConfig } from "./core/config.ts";
 import { OutputWriter } from "./core/output.ts";
@@ -72,30 +72,69 @@ export default function firecrawlExtension(pi: ExtensionAPI) {
 		baseUrl: config.baseUrl,
 	});
 
-	// Resolve once per session so `FIRECRAWL_API_KEY` is exported into this
-	// process before any subagent runs. A restricted subagent uses omp's built-in
+	// Warm the credential so `FIRECRAWL_API_KEY` is exported into this process
+	// before any subagent runs: a restricted subagent uses omp's built-in
 	// `web_search`, which reads that variable to pick the Firecrawl provider.
-	pi.on("session_start", async () => {
-		try {
-			const resolved = await auth.resolve();
-			if (resolved.mode === "keyless") {
-				pi.logger.debug("firecrawl: no key resolved", { error: auth.opError });
-			}
-		} catch (error) {
-			pi.logger.debug("firecrawl: credential warm-up failed", { error });
-		}
+	//
+	// Deliberately NOT awaited. Awaiting it here made a machine whose `op`
+	// binary could not authenticate hang session start until the extension
+	// handler timed out. Credential resolution is never on the startup path.
+	pi.on("session_start", (_event, ctx) => {
+		const timer = ctx.setTimeout(() => {
+			auth
+				.resolve()
+				.then((resolved) => {
+					if (resolved.mode === "keyless") {
+						pi.logger.debug("firecrawl: running keyless", { reason: auth.opError ?? "no key configured" });
+					}
+				})
+				.catch((error: unknown) => {
+					pi.logger.debug("firecrawl: credential warm-up failed", { error });
+				});
+		}, 0);
+		pi.on("session_shutdown", () => ctx.clearTimer(timer));
 	});
 
 	pi.registerCommand("firecrawl", {
-		description: "Firecrawl status (auth, credits, queue). `/firecrawl refresh` re-reads the key from 1Password.",
+		description:
+			"Firecrawl status and auth. `/firecrawl login fc-...` stores an API key, `/firecrawl logout` removes it, `/firecrawl refresh` re-reads it.",
 		handler: async (args, ctx) => {
-			if (args.trim() === "refresh") {
+			const [subcommand, ...rest] = args.trim().split(/\s+/);
+
+			if (subcommand === "login") {
+				const supplied = rest.join("").trim();
+				const key = supplied || (await ctx.ui.input("Firecrawl API key", "fc-...")) || "";
+				if (key.trim() === "") {
+					ctx.ui.notify("No key entered; nothing stored.", "warning");
+					return;
+				}
+				const path = auth.saveKey(key);
+				const resolved = await auth.resolve();
+				ctx.ui.notify(
+					resolved.mode === "api_key"
+						? `Firecrawl key stored (0600) at ${path}. 1Password is not required.`
+						: `Stored a key at ${path}, but it did not resolve — check the value.`,
+					resolved.mode === "api_key" ? "info" : "warning",
+				);
+				return;
+			}
+
+			if (subcommand === "logout") {
+				const removed = auth.forgetKey();
+				ctx.ui.notify(
+					removed ? "Removed the stored Firecrawl key and cached credential." : "No stored key to remove.",
+					"info",
+				);
+				return;
+			}
+
+			if (subcommand === "refresh") {
 				auth.invalidate();
 				const refreshed = await auth.resolve();
 				ctx.ui.notify(
 					refreshed.mode === "api_key"
-						? `Firecrawl key re-read from ${refreshed.source}; cached for ${config.credentialCacheTtlMs / 3_600_000}h.`
-						: `Firecrawl key unavailable (${auth.opError ?? "no source"}); running keyless.`,
+						? `Firecrawl key re-read from ${refreshed.source}.`
+						: `No Firecrawl key available (${auth.opError ?? "none configured"}); running keyless. Use /firecrawl login fc-...`,
 					refreshed.mode === "api_key" ? "info" : "warning",
 				);
 				return;
@@ -105,13 +144,14 @@ export default function firecrawlExtension(pi: ExtensionAPI) {
 			const lines = [
 				`endpoint: ${config.baseUrl}/v2`,
 				`auth: ${resolved.mode}${resolved.source === "none" ? "" : ` (from ${resolved.source})`}`,
-				config.credentialCacheTtlMs > 0
-					? `key cache: ${config.credentialCachePath} (ttl ${config.credentialCacheTtlMs / 3_600_000}h, keeps 1Password from prompting per process)`
-					: "key cache: disabled",
+				`key file: ${config.keyFilePath}`,
 				`web_search takeover: ${config.takeoverWebSearch ? "on" : "off"}`,
 				`inline budget: ${config.inlineChars} chars, spill dir: ${config.cacheDir}`,
 			];
-			if (auth.opError) lines.push(`last 1Password error: ${auth.opError}`);
+			if (resolved.mode === "keyless") lines.push(NO_KEY_HINT);
+			if (auth.opUnusable && config.opEnabled) {
+				lines.push(`1Password not used: ${auth.opError ?? "unavailable"} (optional; ignore if you use a key file)`);
+			}
 			try {
 				const credits = await client.request<{ data?: { remainingCredits?: number; planCredits?: number } }>(
 					"/team/credit-usage",

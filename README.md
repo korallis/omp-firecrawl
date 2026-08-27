@@ -43,23 +43,42 @@ omp plugin link "$PWD"
 
 ## Auth
 
+**Just set a key. 1Password is optional and off the critical path.**
+
+```
+/firecrawl login fc-your-key
+```
+
+That writes the key to `~/.omp/firecrawl/credential` with mode `0600` and it is
+used from then on, on every machine, with no other setup. `/firecrawl logout`
+removes it. Equivalent without a session:
+
+```bash
+mkdir -p ~/.omp/firecrawl && printf 'fc-your-key\n' > ~/.omp/firecrawl/credential
+chmod 600 ~/.omp/firecrawl/credential
+# or just export it
+export FIRECRAWL_API_KEY=fc-your-key
+```
+
 Resolution order:
 
 1. `FIRECRAWL_API_KEY` (or `FIRECRAWL_KEY`) — re-read on every request
-2. on-disk key cache — `~/.omp/cache/firecrawl/credential.json`, mode `0600`
-3. 1Password: `op read op://Dev-Env/Firecrawl/credential`
-4. keyless — Firecrawl's unauthenticated mode, heavily rate limited
+2. the key file above (`FIRECRAWL_KEY_FILE` overrides the path)
+3. a cached 1Password read — `~/.omp/cache/firecrawl/credential.json`, `0600`
+4. 1Password: `op read op://Dev-Env/Firecrawl/credential`
+5. keyless — Firecrawl's unauthenticated mode, heavily rate limited
 
-**Why the cache exists:** every omp session, subagent and `omp -p` run is a new
-process, so consulting 1Password per process means a prompt per process. The
-cache holds the key for 12h (`FIRECRAWL_CREDENTIAL_CACHE_HOURS`), which turns
-that into roughly one `op read` per day for the whole machine. A failed lookup
-is retried once, then retried again after a minute rather than pinned.
+Steps 3 and 4 exist only so a machine that *does* keep the key in 1Password
+does not have to store a copy. They are attempted at most **once per process**,
+behind a 3s `op --version` preflight and a 10s read timeout, never on the
+startup path, and are abandoned for the rest of the process the moment they
+fail. A box with no `op`, or an `op` that cannot reach a vault, costs nothing
+and is reported as informational rather than as an error. Set
+`FIRECRAWL_OP_ENABLED=0` to skip 1Password entirely.
 
-`/firecrawl` reports the resolved mode, cache path, credits and queue depth.
-`/firecrawl refresh` deletes the cache and re-reads from 1Password — use it
-after rotating the key. Set `FIRECRAWL_CREDENTIAL_CACHE_HOURS=0` to disable the
-cache, or `FIRECRAWL_OP_ENABLED=0` to never invoke `op` at all.
+`/firecrawl` reports the resolved source, the key-file path, credits and queue
+depth. `/firecrawl refresh` drops cached credentials and re-resolves — use it
+after rotating a key. It never deletes your key file; `/firecrawl logout` does.
 
 ## Tools
 
@@ -130,6 +149,7 @@ avoid burning credits.
 |---|---|---|
 | `FIRECRAWL_API_KEY` | — | API key; highest priority |
 | `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Self-hosted or proxied endpoint |
+| `FIRECRAWL_KEY_FILE` | `~/.omp/firecrawl/credential` | Key written by `/firecrawl login` |
 | `FIRECRAWL_OP_REF` | `op://Dev-Env/Firecrawl/credential` | 1Password secret reference |
 | `FIRECRAWL_OP_ENABLED` | `1` | Disable the 1Password lookup |
 | `FIRECRAWL_CREDENTIAL_CACHE_HOURS` | `12` | Key cache lifetime; `0` disables it |

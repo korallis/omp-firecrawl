@@ -11,9 +11,15 @@ export interface FirecrawlConfig {
 	baseUrl: string;
 	/** Explicit key from the environment, if any. */
 	envApiKey: string | undefined;
-	/** 1Password secret reference consulted when no env key is present. */
+	/**
+	 * `0600` file holding a key the user supplied with `/firecrawl login`.
+	 * This is the primary way to configure the plugin. It never expires and
+	 * never involves 1Password.
+	 */
+	keyFilePath: string;
+	/** 1Password secret reference consulted only when nothing else has a key. */
 	opRef: string;
-	/** Whether the 1Password lookup is allowed at all. */
+	/** Whether the 1Password lookup may be attempted at all. */
 	opEnabled: boolean;
 	/**
 	 * How long a key read from 1Password may be reused from disk. This is what
@@ -59,6 +65,17 @@ function defaultCacheDir(): string {
 	return `${home}/.omp/cache/firecrawl`;
 }
 
+/**
+ * Durable plugin state, separate from the cache: a key the user typed should
+ * survive a cache wipe.
+ */
+function configDir(): string {
+	const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
+	const xdg = process.env.XDG_CONFIG_HOME;
+	if (xdg && xdg.trim() !== "") return `${xdg.replace(/\/+$/, "")}/omp/firecrawl`;
+	return `${home}/.omp/firecrawl`;
+}
+
 function normalizeBaseUrl(raw: string | undefined): string {
 	const value = (raw ?? "https://api.firecrawl.dev").trim().replace(/\/+$/, "");
 	// Tolerate users pasting a versioned base URL; the client owns the version.
@@ -75,6 +92,7 @@ export function loadConfig(): FirecrawlConfig {
 	return {
 		baseUrl: normalizeBaseUrl(process.env.FIRECRAWL_API_URL ?? process.env.FIRECRAWL_BASE_URL),
 		envApiKey,
+		keyFilePath: process.env.FIRECRAWL_KEY_FILE?.trim() || `${configDir()}/credential`,
 		opRef: process.env.FIRECRAWL_OP_REF?.trim() || "op://Dev-Env/Firecrawl/credential",
 		opEnabled: envFlag("FIRECRAWL_OP_ENABLED", true),
 		// 12h by default: long enough that `op` runs about once a day, short

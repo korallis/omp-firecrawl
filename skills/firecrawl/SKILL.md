@@ -73,12 +73,12 @@ long link lists are always spilled.
 
 ## Auth
 
-Resolution order: `FIRECRAWL_API_KEY` → the `0600` key cache at
-`~/.omp/cache/firecrawl/credential.json` (12h, so 1Password is consulted about
-once a day rather than once per process) → 1Password
-`op://Dev-Env/Firecrawl/credential` → keyless (heavily rate limited).
-`/firecrawl` prints the resolved mode, remaining credits and queue depth;
-`/firecrawl refresh` re-reads the key after a rotation.
+If a tool reports no API key, tell the user to run `/firecrawl login fc-...`
+(stored `0600` at `~/.omp/firecrawl/credential`) or to export
+`FIRECRAWL_API_KEY`. 1Password is an optional convenience, not a requirement —
+never tell someone they need it. Full order: `FIRECRAWL_API_KEY` → key file →
+cached 1Password read → 1Password → keyless (heavily rate limited).
+`/firecrawl` prints the resolved source, credits and queue depth.
 
 ## When a job fails
 
