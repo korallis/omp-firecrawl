@@ -1,6 +1,6 @@
 {
   "name": "@korallis/omp-firecrawl",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The full Firecrawl v2 API as omp/pi tools: web search, developer index, research index, scrape, map, crawl, batch, parse, extract, agent, interact, monitor and account.",
   "keywords": [
     "omp",
@@ -32,14 +32,30 @@
     "LICENSE"
   ],
   "omp": {
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Firecrawl-backed web search, scraping, crawling and research for omp",
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./src/index.ts"],
+    "settings": {
+      "apiKey": {
+        "type": "string",
+        "description": "Firecrawl API key (fc-...). Set with: omp plugin config set @korallis/omp-firecrawl apiKey fc-...",
+        "secret": true,
+        "env": "FIRECRAWL_API_KEY"
+      }
+    }
   },
   "pi": {
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Firecrawl-backed web search, scraping, crawling and research for pi",
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./src/index.ts"],
+    "settings": {
+      "apiKey": {
+        "type": "string",
+        "description": "Firecrawl API key (fc-...). Set with: omp plugin config set @korallis/omp-firecrawl apiKey fc-...",
+        "secret": true,
+        "env": "FIRECRAWL_API_KEY"
+      }
+    }
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

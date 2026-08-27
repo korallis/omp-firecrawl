@@ -73,12 +73,17 @@ long link lists are always spilled.
 
 ## Auth
 
-If a tool reports no API key, tell the user to run `/firecrawl login fc-...`
-(stored `0600` at `~/.omp/firecrawl/credential`) or to export
-`FIRECRAWL_API_KEY`. 1Password is an optional convenience, not a requirement —
-never tell someone they need it. Full order: `FIRECRAWL_API_KEY` → key file →
-cached 1Password read → 1Password → keyless (heavily rate limited).
-`/firecrawl` prints the resolved source, credits and queue depth.
+If a tool reports no API key, give the user all three ways to set one, in this
+order of convenience:
+
+1. `omp plugin config set @korallis/omp-firecrawl apiKey fc-...` — omp's own
+   plugin settings, persists across sessions, masked in output.
+2. `/firecrawl login fc-...` — stored `0600` at `~/.omp/firecrawl/credential`.
+3. `export FIRECRAWL_API_KEY=fc-...`.
+
+1Password is an optional convenience, not a requirement — never tell someone
+they need it. `/firecrawl` prints every source with its current state, plus
+credits and queue depth.
 
 ## When a job fails
 

@@ -144,14 +144,14 @@ export default function firecrawlExtension(pi: ExtensionAPI) {
 			const lines = [
 				`endpoint: ${config.baseUrl}/v2`,
 				`auth: ${resolved.mode}${resolved.source === "none" ? "" : ` (from ${resolved.source})`}`,
-				`key file: ${config.keyFilePath}`,
+				"",
+				"where a key can come from, in priority order:",
+				...auth.describeSources().map((row) => `  ${row}`),
+				"",
 				`web_search takeover: ${config.takeoverWebSearch ? "on" : "off"}`,
 				`inline budget: ${config.inlineChars} chars, spill dir: ${config.cacheDir}`,
 			];
-			if (resolved.mode === "keyless") lines.push(NO_KEY_HINT);
-			if (auth.opUnusable && config.opEnabled) {
-				lines.push(`1Password not used: ${auth.opError ?? "unavailable"} (optional; ignore if you use a key file)`);
-			}
+			if (resolved.mode === "keyless") lines.push("", NO_KEY_HINT);
 			try {
 				const credits = await client.request<{ data?: { remainingCredits?: number; planCredits?: number } }>(
 					"/team/credit-usage",

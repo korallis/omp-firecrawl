@@ -43,32 +43,39 @@ omp plugin link "$PWD"
 
 ## Auth
 
-**Just set a key. 1Password is optional and off the critical path.**
+**Three ways to set a key. 1Password is optional and off the critical path.**
+
+```bash
+# 1. omp's own plugin settings — persists across sessions, masked in output
+omp plugin config set @korallis/omp-firecrawl apiKey fc-your-key
+omp plugin config list @korallis/omp-firecrawl
+```
 
 ```
+# 2. in a session
 /firecrawl login fc-your-key
 ```
 
-That writes the key to `~/.omp/firecrawl/credential` with mode `0600` and it is
-used from then on, on every machine, with no other setup. `/firecrawl logout`
-removes it. Equivalent without a session:
-
 ```bash
-mkdir -p ~/.omp/firecrawl && printf 'fc-your-key\n' > ~/.omp/firecrawl/credential
-chmod 600 ~/.omp/firecrawl/credential
-# or just export it
+# 3. environment
 export FIRECRAWL_API_KEY=fc-your-key
 ```
+
+Option 1 stores it in omp's plugin lockfile
+(`~/.omp/plugins/omp-plugins.lock.json`) and is the right choice on a server or
+for anyone who has never used 1Password. Option 2 writes
+`~/.omp/firecrawl/credential` mode `0600`; `/firecrawl logout` removes it.
 
 Resolution order:
 
 1. `FIRECRAWL_API_KEY` (or `FIRECRAWL_KEY`) — re-read on every request
-2. the key file above (`FIRECRAWL_KEY_FILE` overrides the path)
-3. a cached 1Password read — `~/.omp/cache/firecrawl/credential.json`, `0600`
-4. 1Password: `op read op://Dev-Env/Firecrawl/credential`
-5. keyless — Firecrawl's unauthenticated mode, heavily rate limited
+2. plugin setting `apiKey` — user scope, then project `.omp/plugin-overrides.json`
+3. the key file (`FIRECRAWL_KEY_FILE` overrides the path)
+4. a cached 1Password read — `~/.omp/cache/firecrawl/credential.json`, `0600`
+5. 1Password: `op read op://Dev-Env/Firecrawl/credential`
+6. keyless — Firecrawl's unauthenticated mode, heavily rate limited
 
-Steps 3 and 4 exist only so a machine that *does* keep the key in 1Password
+Steps 4 and 5 exist only so a machine that *does* keep the key in 1Password
 does not have to store a copy. They are attempted at most **once per process**,
 behind a 3s `op --version` preflight and a 10s read timeout, never on the
 startup path, and are abandoned for the rest of the process the moment they
@@ -76,9 +83,22 @@ fail. A box with no `op`, or an `op` that cannot reach a vault, costs nothing
 and is reported as informational rather than as an error. Set
 `FIRECRAWL_OP_ENABLED=0` to skip 1Password entirely.
 
-`/firecrawl` reports the resolved source, the key-file path, credits and queue
-depth. `/firecrawl refresh` drops cached credentials and re-resolves — use it
-after rotating a key. It never deletes your key file; `/firecrawl logout` does.
+`/firecrawl` lists **every** source with its current state, so there is no
+guessing about where to put a key:
+
+```
+auth: keyless
+
+where a key can come from, in priority order:
+  env FIRECRAWL_API_KEY: not set
+  plugin setting apiKey: not set — omp plugin config set @korallis/omp-firecrawl apiKey fc-...
+  key file /home/you/.omp/firecrawl/credential: not created — /firecrawl login fc-...
+  1Password op://Dev-Env/Firecrawl/credential: unavailable (1Password CLI unavailable) — optional
+```
+
+`/firecrawl refresh` drops cached credentials and re-resolves — use it after
+rotating a key, or right after `omp plugin config set`. It never deletes your
+key file; `/firecrawl logout` does.
 
 ## Tools
 
@@ -150,6 +170,7 @@ avoid burning credits.
 | `FIRECRAWL_API_KEY` | — | API key; highest priority |
 | `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Self-hosted or proxied endpoint |
 | `FIRECRAWL_KEY_FILE` | `~/.omp/firecrawl/credential` | Key written by `/firecrawl login` |
+| plugin setting `apiKey` | — | `omp plugin config set @korallis/omp-firecrawl apiKey fc-...` |
 | `FIRECRAWL_OP_REF` | `op://Dev-Env/Firecrawl/credential` | 1Password secret reference |
 | `FIRECRAWL_OP_ENABLED` | `1` | Disable the 1Password lookup |
 | `FIRECRAWL_CREDENTIAL_CACHE_HOURS` | `12` | Key cache lifetime; `0` disables it |

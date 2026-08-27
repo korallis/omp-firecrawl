@@ -12,10 +12,11 @@
  * fails. Nothing in this file may ever be on a blocking startup path.
  */
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { FirecrawlConfig } from "./config.ts";
+import { clearSettingsCache, PACKAGE_NAME, settingsApiKey } from "./settings.ts";
 
 export type FirecrawlAuthMode = "api_key" | "keyless";
 
@@ -23,7 +24,7 @@ export interface FirecrawlAuth {
 	apiKey: string | undefined;
 	mode: FirecrawlAuthMode;
 	/** Where the key came from, for `/firecrawl` diagnostics. */
-	source: "env" | "keyfile" | "cache" | "1password" | "none";
+	source: "env" | "settings" | "keyfile" | "cache" | "1password" | "none";
 }
 
 const KEYLESS: FirecrawlAuth = { apiKey: undefined, mode: "keyless", source: "none" };
@@ -97,6 +98,7 @@ function runOp(args: string[], timeoutMs: number): Promise<OpReadOutcome> {
 export class FirecrawlAuthResolver {
 	#config: FirecrawlConfig;
 	#memoized: string | undefined;
+	#memoizedSource: FirecrawlAuth["source"] = "keyfile";
 	#lastResolved: FirecrawlAuth = KEYLESS;
 	#opError: string | undefined;
 	/** Set once `op` has proven unusable; stops all further attempts. */
@@ -104,9 +106,36 @@ export class FirecrawlAuthResolver {
 	#opAttempt: Promise<string | undefined> | undefined;
 	/** The value this resolver exported to `process.env`, if any. */
 	#seededEnv: string | undefined;
+	/** Directory used to locate project-scoped plugin settings. */
+	#cwd: string;
 
-	constructor(config: FirecrawlConfig) {
+	constructor(config: FirecrawlConfig, cwd: string = process.cwd()) {
 		this.#config = config;
+		this.#cwd = cwd;
+	}
+
+	/**
+	 * Every place a key can come from and whether it is currently set. This is
+	 * what `/firecrawl` prints, so a user who cannot find where to put a key
+	 * sees all the options and their state at once.
+	 */
+	describeSources(): string[] {
+		const envSet = [process.env.FIRECRAWL_API_KEY, process.env.FIRECRAWL_KEY, this.#config.envApiKey].some(
+			(value) => value !== undefined && value.trim() !== "",
+		);
+		const rows = [
+			`env FIRECRAWL_API_KEY: ${envSet ? "set" : "not set"}`,
+			`plugin setting apiKey: ${settingsApiKey(this.#cwd) ? "set" : `not set — omp plugin config set ${PACKAGE_NAME} apiKey fc-...`}`,
+			`key file ${this.#config.keyFilePath}: ${existsSync(this.#config.keyFilePath) ? "present" : "not created — /firecrawl login fc-..."}`,
+		];
+		if (this.#config.opEnabled) {
+			rows.push(
+				`1Password ${this.#config.opRef}: ${this.#opUnusable ? `unavailable (${this.#opError ?? "unknown"}) — optional` : "available"}`,
+			);
+		} else {
+			rows.push("1Password: disabled by FIRECRAWL_OP_ENABLED=0");
+		}
+		return rows;
 	}
 
 	/** Last auth actually used by a request; drives `/firecrawl` output. */
@@ -161,6 +190,9 @@ export class FirecrawlAuthResolver {
 		this.#memoized = undefined;
 		this.#opUnusable = false;
 		this.#opError = undefined;
+		// A key just written with `omp plugin config set` must be picked up now,
+		// not after the settings cache expires.
+		clearSettingsCache();
 		this.#clearSeededEnv();
 		try {
 			rmSync(this.#config.credentialCachePath, { force: true });
@@ -181,13 +213,23 @@ export class FirecrawlAuthResolver {
 		}
 
 		if (this.#memoized) {
-			this.#lastResolved = this.#seed({ apiKey: this.#memoized, mode: "api_key", source: "keyfile" });
+			this.#lastResolved = this.#seed({ apiKey: this.#memoized, mode: "api_key", source: this.#memoizedSource });
+			return this.#lastResolved;
+		}
+
+		// `omp plugin config set <pkg> apiKey fc-...` — the native settings path.
+		const fromSettings = settingsApiKey(this.#cwd);
+		if (fromSettings) {
+			this.#memoized = fromSettings;
+			this.#memoizedSource = "settings";
+			this.#lastResolved = this.#seed({ apiKey: fromSettings, mode: "api_key", source: "settings" });
 			return this.#lastResolved;
 		}
 
 		const fromFile = this.#readKeyFile();
 		if (fromFile) {
 			this.#memoized = fromFile;
+			this.#memoizedSource = "keyfile";
 			this.#lastResolved = this.#seed({ apiKey: fromFile, mode: "api_key", source: "keyfile" });
 			return this.#lastResolved;
 		}
