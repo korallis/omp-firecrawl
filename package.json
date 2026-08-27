@@ -1,6 +1,6 @@
 {
   "name": "@korallis/omp-firecrawl",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "The full Firecrawl v2 API as omp/pi tools: web search, developer index, research index, scrape, map, crawl, batch, parse, extract, agent, interact, monitor and account.",
   "keywords": [
     "omp",
@@ -32,7 +32,7 @@
     "LICENSE"
   ],
   "omp": {
-    "version": "0.1.2",
+    "version": "0.1.3",
     "description": "Firecrawl-backed web search, scraping, crawling and research for omp",
     "extensions": ["./src/index.ts"],
     "settings": {
@@ -45,7 +45,7 @@
     }
   },
   "pi": {
-    "version": "0.1.2",
+    "version": "0.1.3",
     "description": "Firecrawl-backed web search, scraping, crawling and research for pi",
     "extensions": ["./src/index.ts"],
     "settings": {

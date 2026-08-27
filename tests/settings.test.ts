@@ -104,9 +104,30 @@ describe("plugin settings", () => {
 
 	test("describeSources names every place a key can be set", () => {
 		const rows = new FirecrawlAuthResolver(testConfig(), PROJECT).describeSources().join("\n");
-
 		expect(rows).toContain("env FIRECRAWL_API_KEY");
 		expect(rows).toContain(`omp plugin config set ${PACKAGE_NAME} apiKey`);
 		expect(rows).toContain("/firecrawl login");
+	});
+
+	test("our own seeded env value is not reported as a user-set variable", async () => {
+		// Seeding exports FIRECRAWL_API_KEY for omp's built-in web_search. Counting
+		// that as "env: set" would tell a user their environment holds a key.
+		writeUserLock({ [PACKAGE_NAME]: { apiKey: "fc-from-settings" } });
+		const resolver = new FirecrawlAuthResolver(testConfig({ seedEnv: true }), PROJECT);
+		await resolver.resolve();
+
+		expect(process.env.FIRECRAWL_API_KEY).toBe("fc-from-settings");
+		expect(resolver.describeSources().join("\n")).toContain("env FIRECRAWL_API_KEY: not set");
+	});
+
+	test("1Password is reported as not needed when an earlier source won", async () => {
+		writeUserLock({ [PACKAGE_NAME]: { apiKey: "fc-from-settings" } });
+		const resolver = new FirecrawlAuthResolver(testConfig({ opEnabled: true }), PROJECT);
+		await resolver.resolve();
+
+		// It must not claim a probe that never ran.
+		const rows = resolver.describeSources().join("\n");
+		expect(rows).toContain("not needed — a key was found first");
+		expect(rows).not.toContain("read successfully");
 	});
 });

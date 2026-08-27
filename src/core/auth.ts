@@ -103,6 +103,8 @@ export class FirecrawlAuthResolver {
 	#opError: string | undefined;
 	/** Set once `op` has proven unusable; stops all further attempts. */
 	#opUnusable = false;
+	/** Whether a 1Password read was ever actually attempted this process. */
+	#opAttempted = false;
 	#opAttempt: Promise<string | undefined> | undefined;
 	/** The value this resolver exported to `process.env`, if any. */
 	#seededEnv: string | undefined;
@@ -120,20 +122,26 @@ export class FirecrawlAuthResolver {
 	 * sees all the options and their state at once.
 	 */
 	describeSources(): string[] {
+		// Exclude the value we exported ourselves: reporting our own seed as
+		// "set" tells a user their environment holds a key when it does not.
 		const envSet = [process.env.FIRECRAWL_API_KEY, process.env.FIRECRAWL_KEY, this.#config.envApiKey].some(
-			(value) => value !== undefined && value.trim() !== "",
+			(value) => value !== undefined && value.trim() !== "" && value !== this.#seededEnv,
 		);
 		const rows = [
 			`env FIRECRAWL_API_KEY: ${envSet ? "set" : "not set"}`,
 			`plugin setting apiKey: ${settingsApiKey(this.#cwd) ? "set" : `not set — omp plugin config set ${PACKAGE_NAME} apiKey fc-...`}`,
 			`key file ${this.#config.keyFilePath}: ${existsSync(this.#config.keyFilePath) ? "present" : "not created — /firecrawl login fc-..."}`,
 		];
-		if (this.#config.opEnabled) {
-			rows.push(
-				`1Password ${this.#config.opRef}: ${this.#opUnusable ? `unavailable (${this.#opError ?? "unknown"}) — optional` : "available"}`,
-			);
-		} else {
+		if (!this.#config.opEnabled) {
 			rows.push("1Password: disabled by FIRECRAWL_OP_ENABLED=0");
+		} else if (this.#opUnusable) {
+			rows.push(`1Password ${this.#config.opRef}: unavailable (${this.#opError ?? "unknown"}) — optional, ignore this`);
+		} else if (this.#opAttempted) {
+			rows.push(`1Password ${this.#config.opRef}: read successfully`);
+		} else {
+			// Never probed, because an earlier source already had a key. Saying
+			// "available" here would claim a check that never ran.
+			rows.push(`1Password ${this.#config.opRef}: not needed — a key was found first`);
 		}
 		return rows;
 	}
@@ -302,6 +310,7 @@ export class FirecrawlAuthResolver {
 		if (this.#opAttempt) return this.#opAttempt;
 
 		this.#opAttempt = (async () => {
+			this.#opAttempted = true;
 			const preflight = await runOp(["--version"], OP_PREFLIGHT_TIMEOUT_MS);
 			if (!preflight.value) {
 				this.#opUnusable = true;
