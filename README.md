@@ -7,13 +7,39 @@ sessions, `omp -p`, subagents, RPC and ACP hosts.
 ## Install
 
 ```bash
-omp plugin link /Users/leebarry/Projects/omp-firecrawl
+# from npm
+omp plugin install omp-firecrawl
+
+# or straight from GitHub, no npm needed
+omp plugin install github:korallis/omp-firecrawl
+
 omp plugin list
 ```
 
-`plugin link` symlinks the package into `~/.omp/plugins/node_modules` and marks it
-enabled, so the extension, its tools and its skill load for every project. To
-remove it: `omp plugin uninstall omp-firecrawl`.
+Either form runs `bun install` in the omp plugins root
+(`~/.omp/plugins/node_modules`) and marks the plugin enabled, so its tools,
+skill and agent load in every omp instance: interactive sessions, `omp -p`,
+subagents, RPC and ACP hosts. Uninstall with
+`omp plugin uninstall omp-firecrawl`.
+
+The package has **zero runtime dependencies** — the host provides the schema
+builder and the extension API, and every import of them is type-only. Nothing
+is compiled: omp loads the TypeScript sources directly through Bun.
+
+Project-scoped install (this repo only, shadowing any user-level copy):
+
+```bash
+mkdir -p .omp/plugins && cd .omp/plugins
+bun init -y >/dev/null && bun install omp-firecrawl
+```
+
+Local development copy:
+
+```bash
+git clone https://github.com/korallis/omp-firecrawl && cd omp-firecrawl
+bun install
+omp plugin link "$PWD"
+```
 
 ## Auth
 
@@ -132,3 +158,20 @@ bun scripts/smoke.ts firecrawl_map '{"url":"https://docs.firecrawl.dev","limit":
 
 `scripts/smoke.ts` runs any tool against the live API through the same modules
 the extension loads, which is how each tool is verified.
+
+`scripts/` and `tests/` are development-only and are not published; the
+package ships `src/`, `agents/`, `skills/`, `README.md` and `LICENSE`.
+
+### Releasing
+
+```bash
+bun run check                       # must be green
+bun pm pack                         # inspect the tarball contents
+npm publish                         # publishConfig.access is already "public"
+git tag "v$(jq -r .version package.json)" && git push --tags
+```
+
+Bump `version` **and** the `omp.version` / `pi.version` mirrors in
+`package.json` together — the plugin loader overwrites the manifest version
+from the package version, so a mismatch is silently ignored rather than
+reported.

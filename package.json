@@ -1,10 +1,36 @@
 {
   "name": "omp-firecrawl",
   "version": "0.1.0",
-  "private": true,
-  "description": "Firecrawl v2 API as omp/pi tools: search, developer index, research index, scrape, crawl, map, batch, parse, extract, agent, interact, monitor, account.",
-  "type": "module",
+  "description": "The full Firecrawl v2 API as omp/pi tools: web search, developer index, research index, scrape, map, crawl, batch, parse, extract, agent, interact, monitor and account.",
+  "keywords": [
+    "omp",
+    "pi",
+    "oh-my-pi",
+    "firecrawl",
+    "plugin",
+    "extension",
+    "web-search",
+    "scraping",
+    "crawler",
+    "research",
+    "agent-tools"
+  ],
+  "homepage": "https://github.com/korallis/omp-firecrawl#readme",
+  "bugs": "https://github.com/korallis/omp-firecrawl/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korallis/omp-firecrawl.git"
+  },
   "license": "MIT",
+  "author": "Lee Barry",
+  "type": "module",
+  "files": [
+    "src",
+    "agents",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "omp": {
     "version": "0.1.0",
     "description": "Firecrawl-backed web search, scraping, crawling and research for omp",
@@ -21,9 +47,12 @@
     "format": "biome format --write src scripts tests",
     "check": "tsc --noEmit && biome check src scripts tests && bun test"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@biomejs/biome": "2.3.14",
-    "@oh-my-pi/pi-coding-agent": "*",
+    "@oh-my-pi/pi-coding-agent": ">=18",
     "@types/bun": "^1.4.0",
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2"
