@@ -1,0 +1,264 @@
+/**
+ * `web_search` — Firecrawl `/v2/search` registered over the built-in tool.
+ *
+ * Shadowing the built-in name means every existing prompt, skill and subagent
+ * that already calls `web_search` routes through Firecrawl with no rewiring.
+ * The schema is a superset of the built-in one, and on Firecrawl failure the
+ * call is delegated back to the native provider chain via `ctx.invokeTool`,
+ * so takeover never makes search strictly worse.
+ */
+
+import { type FirecrawlDocument, failFrom, type OutputWriter, ok, renderDocument } from "../core/output.ts";
+import { scrapeOptionsSchema } from "../core/schema.ts";
+import { compact, defineTool, type FirecrawlToolEnv, type FirecrawlToolModule } from "../core/tool.ts";
+
+/** `recency` maps onto Google's `tbs` time filter, which Firecrawl forwards. */
+const RECENCY_TBS: Record<string, string> = {
+	hour: "qdr:h",
+	day: "qdr:d",
+	week: "qdr:w",
+	month: "qdr:m",
+	year: "qdr:y",
+};
+
+interface WebResult extends FirecrawlDocument {
+	title?: string;
+	description?: string;
+	url?: string;
+	position?: number;
+	category?: string;
+}
+
+interface NewsResult extends FirecrawlDocument {
+	title?: string;
+	snippet?: string;
+	url?: string;
+	date?: string;
+	imageUrl?: string;
+	position?: number;
+}
+
+interface ImageResult {
+	title?: string;
+	imageUrl?: string;
+	imageWidth?: number;
+	imageHeight?: number;
+	url?: string;
+	position?: number;
+}
+
+interface SearchResponse {
+	success?: boolean;
+	warning?: string;
+	data?: {
+		web?: WebResult[];
+		news?: NewsResult[];
+		images?: ImageResult[];
+	};
+}
+
+function line(index: number, title: string | undefined, url: string | undefined, extra?: string): string {
+	const head = `[${index}] ${title?.trim() || "(untitled)"}`;
+	return extra ? `${head}\n    ${url ?? ""}\n    ${extra}` : `${head}\n    ${url ?? ""}`;
+}
+
+function snippet(text: string | undefined, limit = 320): string | undefined {
+	if (!text) return undefined;
+	const collapsed = text.replace(/\s+/g, " ").trim();
+	if (collapsed === "") return undefined;
+	return collapsed.length > limit ? `${collapsed.slice(0, limit - 1)}…` : collapsed;
+}
+
+const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
+	const { z, client, out } = env;
+
+	const parameters = z.object({
+		query: z
+			.string()
+			.describe(
+				'Search query. Google-style operators work: site:, -site:, inurl:, intitle:, filetype:, "exact phrase", -term, OR.',
+			),
+		limit: z.number().int().optional().describe("Max results per source (1-100, default 10)"),
+		recency: z
+			.enum(["hour", "day", "week", "month", "year"])
+			.optional()
+			.describe("Restrict to recently published pages"),
+		sources: z
+			.array(z.enum(["web", "news", "images"]))
+			.optional()
+			.describe("Result families to query. Default ['web']."),
+		categories: z
+			.array(z.enum(["github", "research", "pdf"]))
+			.optional()
+			.describe("Narrow to a corpus: 'github' repos/code, 'research' papers, 'pdf' documents."),
+		includeDomains: z.array(z.string()).optional().describe("Restrict to these hostnames (no protocol/path)"),
+		excludeDomains: z.array(z.string()).optional().describe("Exclude these hostnames"),
+		location: z.string().optional().describe("Geo hint, e.g. 'London,England,United Kingdom'"),
+		country: z.string().optional().describe("ISO country code for geo-targeting, default 'US'"),
+		tbs: z.string().optional().describe("Raw Google tbs filter; overrides `recency` (e.g. 'sbd:1' to sort by date)"),
+		safe: z.boolean().optional().describe("Enable SafeSearch filtering"),
+		highlights: z
+			.boolean()
+			.optional()
+			.describe("Return query-relevant extracted passages instead of site descriptions. Default true."),
+		scrape: z
+			.boolean()
+			.optional()
+			.describe("Also fetch full page content for every result (slower, costs credits per page)"),
+		scrapeOptions: scrapeOptionsSchema(z)
+			.optional()
+			.describe("Scrape configuration when `scrape` is true; defaults to markdown with cache reuse."),
+		ignoreInvalidURLs: z.boolean().optional().describe("Drop results that other Firecrawl endpoints cannot process"),
+		timeout: z.number().int().optional().describe("Search timeout in ms (default 60000)"),
+		maxChars: z
+			.number()
+			.int()
+			.optional()
+			.describe("Inline character budget per scraped page before spilling to a file"),
+		fallback: z
+			.boolean()
+			.optional()
+			.describe("On Firecrawl failure, retry through omp's built-in search providers. Default true."),
+		num_search_results: z.number().int().optional().describe("Alias for `limit`, accepted for built-in compatibility"),
+		max_tokens: z.number().int().optional().describe("Accepted for built-in compatibility; unused by Firecrawl"),
+		temperature: z.number().optional().describe("Accepted for built-in compatibility; unused by Firecrawl"),
+	});
+
+	return [
+		defineTool({
+			name: "web_search",
+			label: "Web Search",
+			description:
+				"Search the web through Firecrawl and get ranked results with query-relevant highlights, optionally with full page content. Supports Google operators, domain include/exclude, recency, geo-targeting, and corpus filters (github/research/pdf). Falls back to omp's built-in providers if Firecrawl fails.",
+			parameters,
+			loadMode: "essential",
+			approval: "read",
+			async execute(_id, params, signal, _onUpdate, ctx) {
+				const limit = params.limit ?? params.num_search_results;
+				const scrapeOptions = params.scrape
+					? compact({ formats: ["markdown"], onlyMainContent: true, ...(params.scrapeOptions ?? {}) })
+					: params.scrapeOptions
+						? compact(params.scrapeOptions)
+						: undefined;
+
+				const body = compact({
+					query: params.query,
+					limit,
+					sources: params.sources?.map((type) => ({ type })),
+					categories: params.categories?.map((type) => ({ type })),
+					includeDomains: params.includeDomains,
+					excludeDomains: params.excludeDomains,
+					location: params.location,
+					country: params.country,
+					tbs: params.tbs ?? (params.recency ? RECENCY_TBS[params.recency] : undefined),
+					safe: params.safe,
+					highlights: params.highlights,
+					ignoreInvalidURLs: params.ignoreInvalidURLs,
+					timeout: params.timeout,
+					scrapeOptions,
+				});
+
+				try {
+					const response = await client.request<SearchResponse>("/search", {
+						method: "POST",
+						body,
+						signal,
+						timeoutMs: params.timeout ? params.timeout + 15_000 : undefined,
+					});
+					const text = await renderSearch(out, response, params.maxChars);
+					if (text === undefined) {
+						throw new Error(`Firecrawl returned no results for "${params.query}"`);
+					}
+					return ok(text, {
+						provider: "firecrawl",
+						authMode: client.auth.lastResolved.mode,
+						counts: {
+							web: response.data?.web?.length ?? 0,
+							news: response.data?.news?.length ?? 0,
+							images: response.data?.images?.length ?? 0,
+						},
+					});
+				} catch (error) {
+					if (signal?.aborted) throw error;
+					const native = ctx.invokeTool;
+					if (params.fallback !== false && native) {
+						const reason = error instanceof Error ? error.message : String(error);
+						const delegated = await native(
+							compact({
+								query: params.query,
+								limit,
+								recency: params.recency === "hour" ? "day" : params.recency,
+								num_search_results: params.num_search_results,
+								max_tokens: params.max_tokens,
+								temperature: params.temperature,
+							}),
+							{ signal },
+						);
+						const head = {
+							type: "text" as const,
+							text: `Note: Firecrawl search failed (${reason}); used omp's built-in providers.`,
+						};
+						return { ...delegated, content: [head, ...delegated.content] };
+					}
+					return failFrom(error, signal);
+				}
+			},
+		}),
+	];
+};
+
+/** Render Firecrawl's per-source arrays into one flat, cited list. */
+async function renderSearch(
+	out: OutputWriter,
+	response: SearchResponse,
+	maxChars: number | undefined,
+): Promise<string | undefined> {
+	const sections: string[] = [];
+	let index = 0;
+
+	const web = response.data?.web ?? [];
+	if (web.length > 0) {
+		const rows: string[] = [];
+		for (const result of web) {
+			index += 1;
+			const tail = [snippet(result.description)].filter(Boolean).join(" ");
+			rows.push(line(index, result.title, result.url, tail || undefined));
+			if (result.markdown || result.json !== undefined || result.summary) {
+				rows.push(await renderDocument(out, result, { label: result.url, inlineChars: maxChars }));
+			}
+		}
+		sections.push(`## Web (${web.length})\n${rows.join("\n")}`);
+	}
+
+	const news = response.data?.news ?? [];
+	if (news.length > 0) {
+		const rows: string[] = [];
+		for (const result of news) {
+			index += 1;
+			const tail = [result.date, snippet(result.snippet)].filter(Boolean).join(" — ");
+			rows.push(line(index, result.title, result.url, tail || undefined));
+			if (result.markdown) {
+				rows.push(await renderDocument(out, result, { label: result.url, inlineChars: maxChars }));
+			}
+		}
+		sections.push(`## News (${news.length})\n${rows.join("\n")}`);
+	}
+
+	const images = response.data?.images ?? [];
+	if (images.length > 0) {
+		sections.push(
+			`## Images (${images.length})\n${images
+				.map((image, position) => {
+					const size = image.imageWidth && image.imageHeight ? ` ${image.imageWidth}x${image.imageHeight}` : "";
+					return `[${position + 1}] ${image.title ?? "(untitled)"}${size}\n    ${image.imageUrl ?? ""}\n    page: ${image.url ?? ""}`;
+				})
+				.join("\n")}`,
+		);
+	}
+
+	if (sections.length === 0) return undefined;
+	if (response.warning) sections.unshift(`Note: ${response.warning}`);
+	return sections.join("\n\n");
+}
+
+export default module;
