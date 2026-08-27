@@ -1,0 +1,98 @@
+# Hard verify gate. Adapted from ray-fernando-actions-templates/workflows/check.yml.
+#
+# Deviations from the template, and why:
+#   - runs-on: ubuntu-latest, not [self-hosted, macOS]. This gate is
+#     typecheck + lint + unit tests under Bun with no native, Apple or media
+#     dependencies, and no self-hosted runner is registered for this repo. A
+#     workflow pinned to an absent label would queue forever.
+#   - No Rust steps, no rust-toolchain.toml, no cargo cache: there is no Rust.
+#   - No ffmpeg assert: nothing here touches media.
+#   - No VERIFY_SKIP_E2E: `bun run check` has no E2E tier to skip, and the
+#     template forbids adding a flag the verify script ignores.
+#   - queue-stall-alarm.yml is not adopted: it exists to detect a wedged
+#     self-hosted listener, which cannot happen on hosted runners.
+#   - react-doctor.yml is not adopted: no React or TSX in this package.
+#   - cursor-review.yml is not adopted yet: it needs CURSOR_API_KEY and a
+#     fine-grained CURSOR_PUSH_TOKEN on this repo. Add them first, then copy
+#     the template; a review job without its key fails closed on every PR.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "skills/**"
+      - "agents/**"
+  pull_request:
+    # ready_for_review is load-bearing: the job skips drafts, and without this
+    # type a PR opened as draft then marked ready never re-triggers.
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "skills/**"
+      - "agents/**"
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Neutralize any ambient url.*.insteadOf rewrite so checkout uses
+    # GITHUB_TOKEN rather than an SSH key that does not exist here.
+    env:
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_SYSTEM: /dev/null
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Full verification gate
+        # tsc --noEmit && biome check && bun test
+        run: bun run check
+        env:
+          CI: "1"
+
+      - name: Assert the published artifact is complete
+        # The plugin is loaded from source by the host, so the `files`
+        # allowlist is the whole shipped product. A missing entry point or a
+        # dropped agents/skills directory would only surface at install time.
+        run: |
+          set -euo pipefail
+          bun pm pack --destination /tmp/pack >/dev/null
+          tarball=$(ls /tmp/pack/*.tgz)
+          contents=$(tar -tzf "$tarball")
+          for required in \
+            package/src/index.ts \
+            package/agents/web-researcher.md \
+            package/skills/firecrawl/SKILL.md \
+            package/LICENSE \
+            package/README.md
+          do
+            if ! printf '%s\n' "$contents" | grep -qxF "$required"; then
+              echo "::error::$required is missing from the published tarball"
+              exit 1
+            fi
+          done
+          if printf '%s\n' "$contents" | grep -qE '^package/(tests|scripts)/'; then
+            echo "::error::development-only files leaked into the published tarball"
+            exit 1
+          fi
+          printf '%s\n' "$contents" | sort
