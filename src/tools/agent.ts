@@ -110,15 +110,17 @@ function describeEvent(event: AgentTraceEvent): string {
 	const type = event.type ?? "unknown";
 	switch (type) {
 		case "run.started":
-		case "agent.started":
-			return `${type} ${event.agent?.role ?? "?"}:${event.agent?.name ?? event.agent?.id ?? "?"}`;
+		case "agent.started": {
+			const parent = event.agent?.parentId === undefined ? "" : ` parent=${event.agent.parentId}`;
+			return `${type} ${event.agent?.role ?? "?"}:${event.agent?.name ?? event.agent?.id ?? "?"}${parent}`;
+		}
 		case "run.cancel_requested":
 			return `${type} reason=${event.reason ?? "?"}`;
 		case "run.finished":
 		case "agent.finished": {
 			const duration = event.durationMs === undefined ? "" : ` ${(event.durationMs / 1000).toFixed(1)}s`;
 			const error = event.error?.message
-				? ` — ${event.error.code ?? "error"}: ${oneLine(event.error.message, 160)}`
+				? ` — ${event.error.code ?? "error"} (${event.error.source ?? "?"}): ${oneLine(event.error.message, 160)}`
 				: "";
 			return `${type} ${event.outcome ?? "?"}${duration}${error}`;
 		}
@@ -138,12 +140,15 @@ function describeEvent(event: AgentTraceEvent): string {
 		}
 		case "artifact.updated": {
 			const artifact = event.artifact ?? {};
+			const path = artifact.path === undefined ? "" : ` ${artifact.path}`;
 			const items = artifact.itemCount === undefined ? "" : ` items=${artifact.itemCount}`;
 			const fields = artifact.changedFields?.length ? ` fields=${artifact.changedFields.join(",")}` : "";
-			return `artifact ${artifact.kind ?? "?"} ${artifact.change ?? "?"}${items}${fields} snapshotId=${artifact.snapshotId ?? "?"}`;
+			return `artifact ${artifact.kind ?? "?"} ${artifact.change ?? "?"}${path}${items}${fields} snapshotId=${artifact.snapshotId ?? "?"}`;
 		}
-		case "error.occurred":
-			return `error ${event.error?.code ?? "?"} (${event.error?.source ?? "?"}): ${oneLine(event.error?.message, 200)}`;
+		case "error.occurred": {
+			const retry = event.error?.retryable === undefined ? "" : `, retryable=${event.error.retryable}`;
+			return `error ${event.error?.code ?? "?"} (${event.error?.source ?? "?"}${retry}): ${oneLine(event.error?.message, 200)}`;
+		}
 		default:
 			return `${type} ${oneLine(event, 200)}`;
 	}
@@ -166,6 +171,11 @@ async function renderStatus(
 	lines.push(facts.join(" | "));
 
 	if (response.error) lines.push(`error: ${response.error}`);
+	if (response.status === "failed") {
+		lines.push(
+			"This endpoint never reports 'cancelled': a cancelled run reports 'failed' with the cancellation message in `error`. A failed run is not billed for reasoning and has its tool credits refunded, so `creditsUsed` may report 0.",
+		);
+	}
 
 	if (response.data !== undefined && response.data !== null) {
 		lines.push(`\n### Data\n${await out.section(`agent-${jobId}-data`, stringify(response.data), maxChars, "json")}`);
@@ -189,13 +199,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.string()
 			.optional()
 			.describe(
-				"Required for 'start'. What the agent should accomplish and return, written as an objective: which data, from where, and any navigation it must perform (log in, paginate, filter, follow links).",
+				"Required for 'start'. What the agent should accomplish and return, written as an objective: which data, from where, and any navigation it must perform (log in, paginate, filter, follow links). Max 10000 characters.",
 			),
 		urls: z
 			.array(z.string())
 			.optional()
 			.describe(
-				"Starting URLs the agent should work from. Optional: without them the agent finds its own entry points via search.",
+				"Starting URLs the agent should work from. Optional: without them the agent finds its own entry points via search. Required if you set `strictConstrainToURLs`.",
 			),
 		schema: z
 			.record(z.string(), z.unknown())
@@ -206,12 +216,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		strictConstrainToURLs: z
 			.boolean()
 			.optional()
-			.describe("Forbid the agent from visiting anything outside `urls`. Default false."),
+			.describe("Forbid the agent from visiting anything outside `urls`. Default false; pointless without `urls`."),
 		model: z
 			.enum(["spark-2", "spark-1-pro", "spark-1-mini"])
 			.optional()
 			.describe(
-				"Agent model preset. Default and only live model is 'spark-2'; the 'spark-1-*' names are accepted for backwards compatibility and route to spark-2.",
+				"Agent model preset. Default and only live model is 'spark-2'; the 'spark-1-*' names are accepted for backwards compatibility and route to spark-2. Traces and snapshots exist only for spark-2 runs.",
 			),
 		effort: z
 			.enum(["low", "medium", "high"])
@@ -223,16 +233,19 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.number()
 			.optional()
 			.describe(
-				"Hard credit ceiling for the run; the agent stops with outcome 'credit_limit_reached' when hit. Defaults to 2500. Values above 2500 are always billed as paid requests.",
+				"Hard credit ceiling for the run. Defaults to 2500; a run at or below 2500 may consume one of the team's five free daily runs, while anything above 2500 is always billed as a paid request. Hitting the ceiling fails the run with trace outcome 'credit_limit_reached' and returns no data — a failed run is not billed for reasoning and has its tool credits refunded, so `creditsUsed` may then report 0.",
 			),
 		webhook: z
 			.object({
 				url: z.string().describe("Destination URL for agent lifecycle events"),
-				headers: z.record(z.string(), z.string()).optional().describe("Headers sent with each webhook delivery"),
-				metadata: z
-					.record(z.string(), z.unknown())
+				headers: z
+					.record(z.string(), z.string())
 					.optional()
-					.describe("Custom metadata echoed in every payload for this job"),
+					.describe("Headers sent with each webhook delivery; 'x-firecrawl-signature' is reserved and rejected"),
+				metadata: z
+					.record(z.string(), z.string())
+					.optional()
+					.describe("Custom string-valued metadata echoed in every payload for this job"),
 				events: z
 					.array(z.enum(["started", "action", "completed", "failed", "cancelled"]))
 					.optional()
@@ -241,12 +254,16 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.optional()
 			.describe("Webhook target subscribing to agent.started/action/completed/failed/cancelled"),
 		auditMetadata: z
-			.object({ username: z.string().describe("Username attributed to this request") })
+			.object({ username: z.string().describe("Username attributed to this request, max 1024 characters") })
 			.optional()
 			.describe("SIEM attribution metadata, used when SIEM logging is enabled for the team"),
 		threatProtection: threatProtectionSchema(z)
 			.optional()
-			.describe("Per-request Threat Protection override applied to every URL the agent visits"),
+			.describe(
+				"Per-request Threat Protection override applied to every URL the agent visits. Start URLs are screened before the run: a blocked one fails the request with 403 and the scan fee is still charged.",
+			),
+		origin: z.string().optional().describe("Origin identifier recorded for analytics and logging. Default 'api'."),
+		integration: z.string().optional().describe("Optional integration identifier recorded with the request"),
 		jobId: z
 			.string()
 			.optional()
@@ -258,7 +275,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		liveView: z
 			.boolean()
 			.optional()
-			.describe("For 'trace': also return currently active browser sessions with live-view URLs you can open."),
+			.describe(
+				"For 'trace': also return the currently active browser sessions with live-view URLs you can open. Default false; only in-flight runs have any.",
+			),
 		wait: z
 			.boolean()
 			.optional()
@@ -291,7 +310,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			name: "firecrawl_agent",
 			label: "Firecrawl Agent",
 			description:
-				"Run Firecrawl's browser agent (Spark) to gather data that needs multi-step navigation: logging in, paginating, applying filters, following one page's result into another lookup, or deciding where to go next. Actions: 'start', 'status', 'cancel', 'trace' (step-by-step execution log with live browser-view URLs), 'snapshot' (an output artifact at a point in the run). Choose between the three extractors by how much navigation is needed: firecrawl_scrape with the json format for structured data on one known page (cheapest, seconds), firecrawl_extract for one-shot LLM extraction across many URLs or a wildcard site pattern, and this tool when the data is only reachable by acting on the site. This is by far the most expensive and slowest of the three (minutes, up to `maxCredits`, default 2500) — set `maxCredits` and a `schema`, and do not use it for pages a plain scrape can already read.",
+				"Run Firecrawl's browser agent (Spark) to gather data that needs multi-step navigation: logging in, paginating, applying filters, following one page's result into another lookup, or deciding where to go next. Actions: 'start', 'status', 'cancel', 'trace' (step-by-step execution log with live browser-view URLs), 'snapshot' (an output artifact at a point in the run). Choose between the three extractors by how much navigation is needed: firecrawl_scrape with the json format for structured data on one known page (cheapest, seconds), firecrawl_extract for one-shot LLM extraction across many URLs or a wildcard site pattern, and this tool when the data is only reachable by acting on the site or when you cannot name the URLs at all. This is by far the most expensive and slowest of the three (minutes, up to `maxCredits`, default 2500) — set `maxCredits` and a `schema`, and do not use it for pages a plain scrape can already read. Cancellation is cooperative and a cancelled or credit-capped run reports status 'failed', not 'cancelled'.",
 			parameters,
 			approval: "write",
 			async execute(_id, params, signal, onUpdate, _ctx) {
@@ -306,10 +325,10 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 
 						if (action === "status") {
 							const snapshot = await client.request<AgentStatusResponse>(`/agent/${job}`, { signal });
-							const text = await renderStatus(out, jobId, snapshot, maxChars);
-							return snapshot.status === "failed"
-								? fail(text, { id: jobId, status: snapshot.status })
-								: ok(text, { id: jobId, status: snapshot.status, creditsUsed: snapshot.creditsUsed });
+							const collected = snapshot.next ? await client.collectPages(snapshot, { signal }) : snapshot;
+							const text = await renderStatus(out, jobId, collected, maxChars);
+							const details = { id: jobId, status: collected.status, creditsUsed: collected.creditsUsed };
+							return collected.status === "failed" ? fail(text, details) : ok(text, details);
 						}
 
 						if (action === "cancel") {
@@ -321,7 +340,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							return ok(
 								response.success === false
 									? `Firecrawl did not confirm cancellation of agent job ${jobId}; check action:'status'.`
-									: `Cancellation requested for agent job ${jobId}. Credits already spent are not refunded.`,
+									: `Cancellation requested for agent job ${jobId}. Cancellation is cooperative: the step already in flight (a reasoning step, tool call or browser action) runs to a clean stopping point first, so credits keep accruing for a moment and the final creditsUsed can exceed what action:'status' showed when you cancelled. The job then reports status 'failed' with a cancellation message — never 'cancelled' — and a free daily run already consumed is not returned. Cancelling a job that already finished returns 409.`,
 								{ id: jobId, success: response.success },
 							);
 						}
@@ -338,7 +357,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							const shown = events.length > limit ? events.slice(-limit) : events;
 							const rows = shown.map((event) => {
 								const stamp = event.occurredAt ? `${event.occurredAt} ` : "";
-								return `[${event.producerSequence ?? "?"}] ${stamp}${describeEvent(event)}`;
+								const role = event.agent?.role;
+								const actor =
+									role === undefined || role === "orchestrator"
+										? ""
+										: `{${role}:${event.agent?.name ?? event.agent?.id ?? "?"}} `;
+								return `[${event.producerSequence ?? "?"}] ${stamp}${actor}${describeEvent(event)}`;
 							});
 
 							const { path } = await out.spill(`agent-${jobId}-trace`, stringify(trace), "json");
@@ -351,7 +375,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							}
 							lines.push(rows.length > 0 ? `\n${rows.join("\n")}` : "\nNo events recorded yet.");
 							for (const session of trace.activeBrowserSessions ?? []) {
-								lines.push(`\nlive browser ${session.id ?? "?"}: ${session.liveViewUrl ?? "(no url)"}`);
+								const viewport =
+									session.viewport === undefined ? "" : ` (${session.viewport.width}x${session.viewport.height})`;
+								lines.push(`\nlive browser ${session.id ?? "?"}: ${session.liveViewUrl ?? "(no url)"}${viewport}`);
 							}
 							lines.push(`\nRaw trace saved to ${path}`);
 							return ok(lines.join("\n"), { id: jobId, events: events.length, creditsUsed: trace.creditsUsed, path });
@@ -378,8 +404,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 						} catch {
 							// Snapshot is not JSON (markdown, html or plain-text artifact); render it as-is.
 						}
-						const body = await out.section(`agent-${jobId}-snapshot-${snapshotId}`, content, maxChars, "json");
-						return ok(`## Agent snapshot ${snapshotId} (job ${jobId})\n\n${body}`, { id: jobId, snapshotId });
+						const id = response.snapshotId ?? snapshotId;
+						const body = await out.section(`agent-${jobId}-snapshot-${id}`, content, maxChars, "json");
+						return ok(`## Agent snapshot ${id} (job ${response.id ?? jobId})\n\n${body}`, {
+							id: jobId,
+							snapshotId: id,
+						});
 					}
 
 					if (!request.prompt) {

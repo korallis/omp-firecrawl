@@ -22,7 +22,11 @@ interface MapLink {
 
 interface MapResponse {
 	success?: boolean;
+	/** Map job id; the only handle support can correlate a bad result with. */
+	id?: string;
 	links?: MapLink[];
+	/** Advisory note, e.g. "only N results found, try the base domain". */
+	warning?: string;
 }
 
 const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
@@ -50,14 +54,32 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.describe(
 				"Bypass the sitemap cache for fresh URLs. Sitemap data is cached up to 7 days; set true only when the sitemap was just updated, since it is slower.",
 			),
+		filterByPath: z
+			.boolean()
+			.optional()
+			.describe(
+				"Default true: when `url` has a path (e.g. /docs), results are restricted to URLs under that path. Set false to get the whole domain's URLs while still seeding discovery from the subpath.",
+			),
+		useIndex: z
+			.boolean()
+			.optional()
+			.describe(
+				"Default true: include URLs from Firecrawl's own crawl index alongside sitemap and search discovery. Set false for sitemap/search-only results, e.g. when the index holds stale URLs.",
+			),
 		limit: z.number().int().positive().optional().describe("Maximum links to return, default 5000, maximum 100000."),
 		timeout: z
 			.number()
 			.int()
 			.positive()
 			.optional()
-			.describe("Timeout in milliseconds. Unbounded by default; large sites can take a while."),
+			.describe(
+				"Timeout in milliseconds; also caps the sitemap fetch (30000 by default). Unbounded overall by default; exceeding it fails with MAP_TIMEOUT and large sites can take a while.",
+			),
 		location: locationSchema(z).optional().describe("Proxy country and emulated language for geo-varying sitemaps"),
+		headers: z
+			.record(z.string(), z.string())
+			.optional()
+			.describe("Headers used when fetching robots.txt and the sitemap, e.g. a cookie for a gated site"),
 		threatProtection: threatProtectionSchema(z)
 			.optional()
 			.describe("Per-request Threat Protection override for URL scanning (enterprise)"),
@@ -95,8 +117,8 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					const links = response.links ?? [];
 					if (links.length === 0) {
 						return ok(
-							`No URLs found for ${params.url}.${params.search ? ` The \`search\` filter "${params.search}" may be too narrow — retry without it.` : " Try sitemap:'skip' to discover pages by following links instead."}`,
-							{ url: params.url, count: 0 },
+							`No URLs found for ${params.url}.${response.warning ? `\n${response.warning}` : ""}${params.search ? ` The \`search\` filter "${params.search}" may be too narrow — retry without it.` : " Try sitemap:'skip' to discover pages by following links instead, or filterByPath:false if you mapped a subpath."}`,
+							{ url: params.url, count: 0, id: response.id, warning: response.warning },
 						);
 					}
 
@@ -118,11 +140,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 
 					const header = `# Site map for ${params.url} (${links.length} URL${links.length === 1 ? "" : "s"})${
 						params.search ? `\nranked by relevance to "${params.search}"` : ""
-					}`;
+					}${response.warning ? `\nwarning: ${response.warning}` : ""}`;
 					return ok(`${header}\n\n${listing}`, {
 						url: params.url,
+						id: response.id,
 						count: links.length,
 						urls: links.slice(0, INLINE_LINK_LIMIT).map((link) => link.url),
+						warning: response.warning,
 						fullListPath: spilledPath,
 					});
 				} catch (error) {

@@ -85,8 +85,25 @@ describe("FirecrawlAuthResolver", () => {
 	test("ttl 0 disables the cache entirely", async () => {
 		seedCache({ ref: "op://Test/Firecrawl/credential", key: "fc-cached", fetchedAt: Date.now() });
 		const resolved = await new FirecrawlAuthResolver(testConfig({ credentialCacheTtlMs: 0 })).resolve();
-
 		expect(resolved.mode).toBe("keyless");
+	});
+
+	test("a resolved key is exported to the process so the built-in web_search can use it", async () => {
+		// A restricted subagent (scout, librarian, any agent with an explicit
+		// tools list) uses omp's built-in web_search, which reads this variable.
+		seedCache({ ref: "op://Test/Firecrawl/credential", key: "fc-seeded", fetchedAt: Date.now() });
+		await new FirecrawlAuthResolver(testConfig()).resolve();
+
+		expect(process.env.FIRECRAWL_API_KEY).toBe("fc-seeded");
+	});
+
+	test("seeding is skipped when FIRECRAWL_SEED_ENV is 0", async () => {
+		process.env.FIRECRAWL_SEED_ENV = "0";
+		seedCache({ ref: "op://Test/Firecrawl/credential", key: "fc-seeded", fetchedAt: Date.now() });
+		await new FirecrawlAuthResolver(testConfig()).resolve();
+
+		expect(process.env.FIRECRAWL_API_KEY).toBeUndefined();
+		delete process.env.FIRECRAWL_SEED_ENV;
 	});
 
 	test("a written cache file is owner-readable only", async () => {

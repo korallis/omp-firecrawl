@@ -25,10 +25,16 @@ import { compact, defineTool, type FirecrawlToolEnv, type FirecrawlToolModule } 
 interface CrawlStartResponse {
 	success?: boolean;
 	id?: string;
+	/** Status endpoint for the new job, not the crawled site. */
 	url?: string;
+	/** Only returned when `prompt` was sent: what the prompt was turned into. */
+	promptGeneratedOptions?: Record<string, unknown>;
+	/** Only returned when `prompt` was sent: prompt-derived options merged with explicit ones. */
+	finalCrawlerOptions?: Record<string, unknown>;
 }
 
 interface CrawlStatusResponse {
+	success?: boolean;
 	status?: string;
 	total?: number;
 	completed?: number;
@@ -39,6 +45,10 @@ interface CrawlStatusResponse {
 	duration?: number;
 	next?: string | null;
 	data?: FirecrawlDocument[];
+	/** Set when the crawl failed before any page was queued. */
+	error?: string;
+	/** Advisory note, e.g. robots.txt blocked pages or a suspiciously thin result. */
+	warning?: string;
 }
 
 interface CrawlCancelResponse {
@@ -46,13 +56,13 @@ interface CrawlCancelResponse {
 }
 
 interface CrawlErrorsResponse {
-	errors?: Array<{ id?: string; timestamp?: string; url?: string; error?: string }>;
+	errors?: Array<{ id?: string; timestamp?: string; url?: string; code?: string; error?: string }>;
 	robotsBlocked?: string[];
 }
 
 interface ActiveCrawlsResponse {
 	success?: boolean;
-	crawls?: Array<{ id?: string; teamId?: string; url?: string; options?: unknown }>;
+	crawls?: Array<{ id?: string; teamId?: string; url?: string; created_at?: string; options?: unknown }>;
 }
 
 interface CrawlParamsPreviewResponse {
@@ -68,17 +78,51 @@ const TERMINAL_CRAWL_STATUSES: Record<string, true> = {
 	canceled: true,
 };
 
+/**
+ * Fields `POST /crawl` accepts. Its body schema rejects unknown keys, and
+ * `params-preview` can emit legacy ones (`maxDepth`), so derived parameters are
+ * split against this table before being recommended for reuse.
+ */
+const CRAWL_START_FIELDS: Record<string, true> = {
+	url: true,
+	prompt: true,
+	includePaths: true,
+	excludePaths: true,
+	regexOnFullURL: true,
+	maxDiscoveryDepth: true,
+	sitemap: true,
+	ignoreQueryParameters: true,
+	deduplicateSimilarURLs: true,
+	limit: true,
+	crawlEntireDomain: true,
+	allowExternalLinks: true,
+	allowSubdomains: true,
+	ignoreRobotsTxt: true,
+	robotsUserAgent: true,
+	delay: true,
+	maxConcurrency: true,
+	webhook: true,
+	scrapeOptions: true,
+	zeroDataRetention: true,
+};
+
 function crawlHeadline(id: string, snapshot: CrawlStatusResponse): string {
 	const facts: string[] = [`status: ${snapshot.status ?? "unknown"}`];
 	if (snapshot.completed !== undefined || snapshot.total !== undefined) {
 		facts.push(`pages: ${snapshot.completed ?? 0}/${snapshot.total ?? 0}`);
 	}
-	if (snapshot.creditsUsed !== undefined) facts.push(`credits used: ${snapshot.creditsUsed}`);
+	// Firecrawl reports -1 when its billing lookup failed; that is not a charge.
+	if (snapshot.creditsUsed !== undefined) {
+		facts.push(`credits used: ${snapshot.creditsUsed < 0 ? "unknown" : snapshot.creditsUsed}`);
+	}
 	if (snapshot.duration !== undefined) facts.push(`duration: ${snapshot.duration.toFixed(1)}s`);
 	if (snapshot.createdAt) facts.push(`created: ${snapshot.createdAt}`);
 	if (snapshot.completedAt) facts.push(`finished: ${snapshot.completedAt}`);
 	if (snapshot.expiresAt) facts.push(`expires: ${snapshot.expiresAt}`);
-	return `# Crawl ${id}\n${facts.join(" | ")}`;
+	const lines = [`# Crawl ${id}`, facts.join(" | ")];
+	if (snapshot.error) lines.push(`error: ${snapshot.error}`);
+	if (snapshot.warning) lines.push(`warning: ${snapshot.warning}`);
+	return lines.join("\n");
 }
 
 /** Render up to `maxDocuments` crawled pages; the rest becomes a spilled URL manifest. */
@@ -131,13 +175,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.string()
 			.optional()
 			.describe(
-				"Natural-language crawl instruction (e.g. 'only the docs pages, skip changelogs'). Firecrawl derives the path filters and depth limits from it; any parameter you set explicitly overrides the derived value. Required for 'preview', optional for 'start'.",
+				"Natural-language crawl instruction (e.g. 'only the docs pages, skip changelogs'), max 10000 chars. Firecrawl derives the path filters and depth limits from it; any parameter you set explicitly overrides the derived value, and 'start' then reports both the derived and the effective option sets. Required for 'preview', optional for 'start'.",
 			),
 		includePaths: z
 			.array(z.string())
 			.optional()
 			.describe(
-				"URL pathname regex patterns to include; only matching paths are crawled. The starting URL is also tested against these patterns.",
+				"URL pathname regex patterns to include; only matching paths are crawled. The starting URL is also tested against these patterns. Invalid regex is rejected with a 400.",
 			),
 		excludePaths: z
 			.array(z.string())
@@ -154,25 +198,31 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.int()
 			.optional()
 			.describe(
-				"Maximum depth in discovery order. The entered URL and sitemapped pages are depth 0, so with sitemap:'skip' a value of 1 crawls the entered URL plus its direct links.",
+				"Maximum depth in discovery order. The entered URL and sitemapped pages are depth 0, so with sitemap:'skip' a value of 1 crawls the entered URL plus its direct links. This is the only depth control /crawl accepts — the legacy `maxDepth` (slash count) is preview-only and rejected here.",
 			),
 		sitemap: z
 			.enum(["skip", "include", "only"])
 			.optional()
 			.describe(
-				"Sitemap mode, default 'include'. 'skip' ignores the sitemap and discovers pages by following links; 'only' crawls just the sitemap URLs.",
+				"Sitemap mode, default 'include'. 'skip' ignores the sitemap and discovers pages by following links; 'only' crawls just the sitemap URLs plus the start URL and never follows HTML links.",
 			),
 		ignoreQueryParameters: z
 			.boolean()
 			.optional()
 			.describe("Treat URLs differing only by query string as the same page. Default false."),
+		deduplicateSimilarURLs: z
+			.boolean()
+			.optional()
+			.describe(
+				"Collapse URLs Firecrawl considers variants of one page (trailing slash, index suffixes, near-identical paths). Default true, so a crawl can legitimately return fewer pages than the site has links; set false when you need every variant scraped.",
+			),
 		limit: z
 			.number()
 			.int()
 			.positive()
 			.optional()
 			.describe(
-				"Maximum pages to crawl, default 10000. Each page costs at least 1 credit, so set this deliberately — a large site can burn thousands of credits.",
+				"Maximum pages to crawl, default 10000. Each page costs at least 1 credit, so set this deliberately — a large site can burn thousands of credits. Firecrawl silently lowers it to your remaining credit balance.",
 			),
 		crawlEntireDomain: z
 			.boolean()
@@ -180,7 +230,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.describe(
 				"Follow sibling and parent links instead of only deeper child paths. Default false (child paths only, e.g. /features/x -> /features/x/tips but never /pricing).",
 			),
-		allowExternalLinks: z.boolean().optional().describe("Follow links to other domains, one hop deep. Default false."),
+		allowExternalLinks: z
+			.boolean()
+			.optional()
+			.describe(
+				"Follow links to other domains, one hop deep (links found on those external pages are not crawled). Links to an external site's bare homepage are skipped and reported by action:'errors' with code EXTERNAL_LINK. Default false.",
+			),
 		allowSubdomains: z.boolean().optional().describe("Follow links to subdomains of the base domain. Default false."),
 		ignoreRobotsTxt: z
 			.boolean()
@@ -192,15 +247,19 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.describe("User-Agent used to fetch and match robots.txt rules. Enterprise plans only."),
 		delay: z
 			.number()
-			.nonnegative()
+			.positive()
 			.optional()
-			.describe("Seconds to wait between page scrapes, to respect rate limits. Setting it forces concurrency to 1."),
+			.describe(
+				"Seconds to wait between page scrapes, to respect rate limits; max 60. Setting it forces concurrency to 1, so a large crawl becomes correspondingly slower.",
+			),
 		maxConcurrency: z
 			.number()
 			.int()
 			.positive()
 			.optional()
-			.describe("Cap concurrent scrapes for this crawl. Defaults to the team's concurrency limit."),
+			.describe(
+				"Cap concurrent scrapes for this crawl. Defaults to the team's concurrency limit, and is clamped down to it.",
+			),
 		webhook: webhookSchema(z)
 			.optional()
 			.describe(
@@ -212,7 +271,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		zeroDataRetention: z
 			.boolean()
 			.optional()
-			.describe("Enable zero data retention for this crawl. Must be enabled for the team first."),
+			.describe(
+				"Enable zero data retention for this crawl (top-level only — the API rejects it inside `scrapeOptions`). Must be enabled for the team first.",
+			),
 		wait: z
 			.boolean()
 			.optional()
@@ -239,6 +300,22 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.positive()
 			.optional()
 			.describe("Cap on paginated result pages followed when collecting crawl output. Default 20 (~200MB ceiling)."),
+		resultSkip: z
+			.number()
+			.int()
+			.nonnegative()
+			.optional()
+			.describe(
+				"For 'status': skip this many crawled documents server-side (`?skip=`) so a window of a huge crawl can be read without transferring the earlier pages. Default 0.",
+			),
+		resultLimit: z
+			.number()
+			.int()
+			.positive()
+			.optional()
+			.describe(
+				"For 'status': return at most this many documents starting at `resultSkip` (`?limit=`). Leave collectAll false when windowing, otherwise the following pages are merged back in.",
+			),
 		maxDocuments: z
 			.number()
 			.int()
@@ -259,7 +336,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			name: "firecrawl_crawl",
 			label: "Firecrawl Crawl",
 			description:
-				"Crawl a whole site or site section with Firecrawl and get clean markdown/JSON for every page. Prefer this over repeated firecrawl_scrape calls when you need many pages under one domain, and prefer firecrawl_map when you only need the URL list. Costs at least 1 credit per page and can run for minutes, so bound it with `limit`, `includePaths`/`excludePaths` and `maxDiscoveryDepth`. Actions: 'start' (launch; polls to completion by default, or wait:false to get a job id), 'status' (progress plus pages, collectAll to follow pagination), 'cancel' (stop a running crawl), 'errors' (failed URLs and robots.txt blocks), 'active' (this team's in-flight crawls), 'preview' (turn a natural-language prompt into concrete crawl parameters for free before spending credits).",
+				"Crawl a whole site or site section with Firecrawl and get clean markdown/JSON for every page. Prefer this over repeated firecrawl_scrape calls when you need many pages under one domain, and prefer firecrawl_map when you only need the URL list. Costs at least 1 credit per page and can run for minutes, so bound it with `limit`, `includePaths`/`excludePaths` and `maxDiscoveryDepth`. Actions: 'start' (launch; polls to completion by default, or wait:false to get a job id), 'status' (progress plus pages, collectAll to follow pagination, resultSkip/resultLimit to window a huge crawl), 'cancel' (stop a running crawl), 'errors' (failed URLs with error codes and robots.txt blocks), 'active' (this team's in-flight crawls), 'preview' (turn a natural-language prompt into concrete crawl parameters for free before spending credits).",
 			parameters,
 			approval: "write",
 			async execute(_id, params, signal, onUpdate, _ctx) {
@@ -272,6 +349,8 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					waitTimeout,
 					collectAll,
 					maxResultPages,
+					resultSkip,
+					resultLimit,
 					maxDocuments,
 					maxChars,
 					...crawlFields
@@ -307,10 +386,31 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							if (!jobId) {
 								return fail("Firecrawl accepted the crawl but returned no job id.", started);
 							}
+							// Only present when `prompt` was sent, and the only way to see what the
+							// prompt actually became — a crawl driven by a misread prompt otherwise
+							// looks like a crawl that simply found nothing.
+							const derivedBlock = started.finalCrawlerOptions
+								? `\n\n## Effective crawler options\n${await out.section(
+										`crawl-${jobId}-options`,
+										stringify({
+											promptGeneratedOptions: started.promptGeneratedOptions,
+											finalCrawlerOptions: started.finalCrawlerOptions,
+										}),
+										maxChars,
+										"json",
+									)}`
+								: "";
 							if (wait === false) {
 								return ok(
-									`Crawl started.\nid: ${jobId}\nurl: ${started.url ?? url}\n\nFetch results with firecrawl_crawl action:"status", id:"${jobId}" (add collectAll:true once it completes). Stop it early with action:"cancel", id:"${jobId}". Inspect failures with action:"errors", id:"${jobId}".`,
-									{ id: jobId, url: started.url ?? url, status: "started" },
+									`Crawl started.\nid: ${jobId}\ncrawling: ${url}\nstatus url: ${started.url ?? "(not returned)"}${derivedBlock}\n\nFetch results with firecrawl_crawl action:"status", id:"${jobId}" (add collectAll:true once it completes). Stop it early with action:"cancel", id:"${jobId}". Inspect failures with action:"errors", id:"${jobId}".`,
+									{
+										id: jobId,
+										url,
+										statusUrl: started.url,
+										status: "started",
+										promptGeneratedOptions: started.promptGeneratedOptions,
+										finalCrawlerOptions: started.finalCrawlerOptions,
+									},
 								);
 							}
 
@@ -341,7 +441,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 									? `Still running when polling stopped. Resume with firecrawl_crawl action:"status", id:"${jobId}", collectAll:true.`
 									: undefined;
 							const text = [
-								crawlHeadline(jobId, collected),
+								`${crawlHeadline(jobId, collected)}${derivedBlock}`,
 								`pages returned: ${docs.length}`,
 								...(unfinished ? [unfinished] : []),
 								await renderCrawlDocuments(out, docs, documentBudget, maxChars),
@@ -352,13 +452,19 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 								completed: collected.completed,
 								total: collected.total,
 								creditsUsed: collected.creditsUsed,
+								expiresAt: collected.expiresAt,
+								error: collected.error,
+								warning: collected.warning,
 								returned: docs.length,
 								rendered: Math.min(docs.length, documentBudget),
+								promptGeneratedOptions: started.promptGeneratedOptions,
+								finalCrawlerOptions: started.finalCrawlerOptions,
 							});
 						}
 
 						case "status": {
 							const snapshot = await client.request<CrawlStatusResponse>(`/crawl/${encodeURIComponent(crawlId)}`, {
+								query: { skip: resultSkip, limit: resultLimit },
 								signal,
 							});
 							const collected =
@@ -367,11 +473,11 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 									: snapshot;
 							const docs = collected.data ?? [];
 							const pagination = collected.next
-								? `More results remain. ${collectAll === true ? "Pagination cap reached — raise `maxResultPages`." : "Set collectAll:true to merge every page."}`
+								? `More results remain. ${collectAll === true ? "Pagination cap reached — raise `maxResultPages`." : "Set collectAll:true to merge every page, or window with resultSkip/resultLimit."}`
 								: undefined;
 							const text = [
 								crawlHeadline(crawlId, collected),
-								`pages returned: ${docs.length}`,
+								`pages returned: ${docs.length}${resultSkip ? ` (from offset ${resultSkip})` : ""}`,
 								...(pagination ? [pagination] : []),
 								await renderCrawlDocuments(out, docs, documentBudget, maxChars),
 							].join("\n\n");
@@ -382,6 +488,11 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 								total: collected.total,
 								creditsUsed: collected.creditsUsed,
 								expiresAt: collected.expiresAt,
+								createdAt: collected.createdAt,
+								completedAt: collected.completedAt,
+								duration: collected.duration,
+								error: collected.error,
+								warning: collected.warning,
 								returned: docs.length,
 								hasMore: Boolean(collected.next),
 							});
@@ -406,6 +517,14 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							);
 							const errors = response.errors ?? [];
 							const blocked = response.robotsBlocked ?? [];
+							const codeCounts: Record<string, number> = {};
+							for (const entry of errors) {
+								const code = entry.code ?? "UNCODED";
+								codeCounts[code] = (codeCounts[code] ?? 0) + 1;
+							}
+							const codeSummary = Object.entries(codeCounts)
+								.map(([code, count]) => `${code} x${count}`)
+								.join(", ");
 							const errorText =
 								errors.length === 0
 									? "No failed scrapes."
@@ -414,7 +533,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 											errors
 												.map((entry, position) => {
 													const lines = [`[${position + 1}] ${entry.url ?? "(unknown url)"}`];
-													lines.push(`    ${entry.error ?? "(no error message)"}`);
+													lines.push(
+														`    ${entry.code ? `${entry.code}: ` : ""}${entry.error ?? "(no error message)"}`,
+													);
 													if (entry.timestamp) lines.push(`    at ${entry.timestamp}`);
 													if (entry.id) lines.push(`    scrape id: ${entry.id}`);
 													return lines.join("\n");
@@ -432,11 +553,16 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 										);
 							const text = [
 								`# Crawl ${crawlId} errors`,
-								`failed scrapes: ${errors.length} | blocked by robots.txt: ${blocked.length}`,
+								`failed scrapes: ${errors.length} | blocked by robots.txt: ${blocked.length}${codeSummary ? `\ncodes: ${codeSummary}` : ""}`,
 								`## Failed URLs\n${errorText}`,
 								`## Blocked by robots.txt\n${blockedText}`,
 							].join("\n\n");
-							return ok(text, { id: crawlId, failed: errors.length, robotsBlocked: blocked.length });
+							return ok(text, {
+								id: crawlId,
+								failed: errors.length,
+								robotsBlocked: blocked.length,
+								codes: codeCounts,
+							});
 						}
 
 						case "active": {
@@ -448,6 +574,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							const rows = crawls.map((crawl, position) => {
 								const lines = [`[${position + 1}] ${crawl.id ?? "(no id)"}`];
 								lines.push(`    url: ${crawl.url ?? "(unknown)"}`);
+								if (crawl.created_at) lines.push(`    started: ${crawl.created_at}`);
 								if (crawl.teamId) lines.push(`    team: ${crawl.teamId}`);
 								return lines.join("\n");
 							});
@@ -462,7 +589,15 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 											"json",
 										)}`;
 							const text = `# Active crawls (${crawls.length})\n${rows.join("\n")}${optionsBlock}\n\nRead any of them with action:"status", id:"<id>".`;
-							return ok(text, { count: crawls.length, ids: crawls.map((crawl) => crawl.id) });
+							return ok(text, {
+								count: crawls.length,
+								crawls: crawls.map((crawl) => ({
+									id: crawl.id,
+									url: crawl.url,
+									teamId: crawl.teamId,
+									createdAt: crawl.created_at,
+								})),
+							});
 						}
 
 						case "preview": {
@@ -476,14 +611,17 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							if (!derived) {
 								return fail("Firecrawl returned no derived crawl parameters for this prompt.", response);
 							}
+							const unsupported = Object.keys(derived).filter((field) => CRAWL_START_FIELDS[field] !== true);
 							const json = await out.section(`crawl-params-${url}`, stringify(derived), maxChars, "json");
 							const text = [
 								"# Derived crawl parameters",
 								`url: ${url}\nprompt: ${prompt}`,
 								json,
-								'Reuse these fields verbatim in action:"start" (explicitly passed parameters always win over prompt-derived ones). No pages were crawled, so no credits were spent.',
+								unsupported.length === 0
+									? 'Reuse these fields verbatim in action:"start" (explicitly passed parameters always win over prompt-derived ones). No pages were crawled, so no credits were spent.'
+									: `Reuse these fields in action:"start" (explicitly passed parameters always win over prompt-derived ones), except ${unsupported.join(", ")} — the preview still emits legacy field(s) that POST /crawl rejects; express depth as \`maxDiscoveryDepth\` instead. No pages were crawled, so no credits were spent.`,
 							].join("\n\n");
-							return ok(text, derived);
+							return ok(text, { ...derived, unsupportedByStart: unsupported });
 						}
 
 						default:

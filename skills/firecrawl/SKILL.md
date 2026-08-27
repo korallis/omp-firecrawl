@@ -12,6 +12,17 @@ providers if Firecrawl fails, so ordinary search needs no special handling.
 Everything else is a discoverable device: read `xd://firecrawl_<name>` for its
 schema before first use.
 
+**Delegating research.** For anything past a couple of searches — comparing
+sources, reading a docs section, extracting a table from several pages — hand
+off to the `web-researcher` agent instead of doing it inline:
+`task({ context, tasks: [{ agent: "web-researcher", task: "..." }] })`. It has
+the complete Firecrawl surface and returns `{ answer, sources[], files[], gaps }`.
+That keeps page content out of your own context.
+
+**If you are an agent with an explicit tool list** and `web_search` is not
+behaving like the table below, you are on omp's built-in search. Use
+`firecrawl_search` — same tool, name that cannot collide with the built-in.
+
 ## Choose the tool
 
 | Need | Tool |

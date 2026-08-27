@@ -55,10 +55,13 @@ export default function firecrawlExtension(pi: ExtensionAPI) {
 
 	pi.setLabel("Firecrawl");
 
-	const modules = config.takeoverWebSearch ? [webSearch, ...CORE_MODULES] : CORE_MODULES;
+	// The search module registers both `web_search` (shadowing the built-in) and
+	// the `firecrawl_search` alias. Only the shadow is optional; the alias is how
+	// restricted agents reach Firecrawl at all.
 	let registered = 0;
-	for (const module of modules) {
+	for (const module of [webSearch, ...CORE_MODULES]) {
 		for (const tool of module(env)) {
+			if (tool.name === "web_search" && !config.takeoverWebSearch) continue;
 			pi.registerTool(tool);
 			registered += 1;
 		}
@@ -67,6 +70,20 @@ export default function firecrawlExtension(pi: ExtensionAPI) {
 		count: registered,
 		takeoverWebSearch: config.takeoverWebSearch,
 		baseUrl: config.baseUrl,
+	});
+
+	// Resolve once per session so `FIRECRAWL_API_KEY` is exported into this
+	// process before any subagent runs. A restricted subagent uses omp's built-in
+	// `web_search`, which reads that variable to pick the Firecrawl provider.
+	pi.on("session_start", async () => {
+		try {
+			const resolved = await auth.resolve();
+			if (resolved.mode === "keyless") {
+				pi.logger.debug("firecrawl: no key resolved", { error: auth.opError });
+			}
+		} catch (error) {
+			pi.logger.debug("firecrawl: credential warm-up failed", { error });
+		}
 	});
 
 	pi.registerCommand("firecrawl", {

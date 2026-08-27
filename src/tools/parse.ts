@@ -355,7 +355,10 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					if (Array.isArray(doc.blocks)) {
 						const pages = doc.blocks as BlockPage[];
 						const counts: Record<string, number> = {};
+						let degraded = 0;
 						for (const page of pages) {
+							// Page rollup is ok | partial | failed; anything but ok means text is missing.
+							if (page.status !== undefined && page.status !== "ok") degraded += 1;
 							for (const item of page.items ?? []) {
 								const type = item.type ?? "unknown";
 								counts[type] = (counts[type] ?? 0) + 1;
@@ -365,7 +368,8 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							.sort((left, right) => right[1] - left[1])
 							.map(([type, count]) => `${type}=${count}`)
 							.join(", ");
-						notes.push(`Layout blocks: ${pages.length} pages${summary === "" ? "" : ` — ${summary}`}`);
+						const degradedNote = degraded === 0 ? "" : ` — ${degraded} page(s) partial or failed`;
+						notes.push(`Layout blocks: ${pages.length} pages${summary === "" ? "" : ` — ${summary}`}${degradedNote}`);
 					}
 					if (doc.pages && doc.pages.length > 0) notes.push(`Per-page markdown: ${doc.pages.length} pages`);
 
@@ -375,6 +379,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 						bytes: bytes.byteLength,
 						contentType,
 						pages: doc.pages?.length,
+						// totalPages > numPages means maxPages truncated the parse.
+						numPages: doc.metadata?.numPages,
+						totalPages: doc.metadata?.totalPages,
 						formats: Object.keys(doc).filter((key) => key !== "metadata"),
 					});
 				} catch (error) {

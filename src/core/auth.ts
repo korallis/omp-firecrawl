@@ -77,6 +77,8 @@ export class FirecrawlAuthResolver {
 	#inFlight: Promise<OpReadOutcome> | undefined;
 	#lastResolved: FirecrawlAuth = KEYLESS;
 	#opError: string | undefined;
+	/** The value this resolver exported to `process.env`, if any. */
+	#seededEnv: string | undefined;
 
 	constructor(config: FirecrawlConfig) {
 		this.#config = config;
@@ -93,12 +95,19 @@ export class FirecrawlAuthResolver {
 	}
 
 	/**
-	 * Forget the key everywhere, so a rotated secret is picked up. Called on
-	 * 401/403 and by `/firecrawl refresh`.
+	 * Forget the key everywhere, so a rotated secret is picked up. Called on a
+	 * 401 and by `/firecrawl refresh`.
 	 */
 	invalidate(): void {
 		this.#memoized = undefined;
 		this.#failedUntil = 0;
+		// Also drop the value we exported, or the stale key would keep winning:
+		// `resolve()` checks the environment first. Never touch a value the user
+		// set themselves.
+		if (this.#seededEnv !== undefined && process.env.FIRECRAWL_API_KEY === this.#seededEnv) {
+			delete process.env.FIRECRAWL_API_KEY;
+		}
+		this.#seededEnv = undefined;
 		try {
 			rmSync(this.#config.credentialCachePath, { force: true });
 		} catch {
@@ -118,14 +127,14 @@ export class FirecrawlAuthResolver {
 		}
 
 		if (this.#memoized) {
-			this.#lastResolved = { apiKey: this.#memoized, mode: "api_key", source: "cache" };
+			this.#lastResolved = this.#seed({ apiKey: this.#memoized, mode: "api_key", source: "cache" });
 			return this.#lastResolved;
 		}
 
 		const cached = this.#readCache();
 		if (cached) {
 			this.#memoized = cached;
-			this.#lastResolved = { apiKey: cached, mode: "api_key", source: "cache" };
+			this.#lastResolved = this.#seed({ apiKey: cached, mode: "api_key", source: "cache" });
 			return this.#lastResolved;
 		}
 
@@ -133,12 +142,30 @@ export class FirecrawlAuthResolver {
 		if (fromOp) {
 			this.#memoized = fromOp;
 			this.#writeCache(fromOp);
-			this.#lastResolved = { apiKey: fromOp, mode: "api_key", source: "1password" };
+			this.#lastResolved = this.#seed({ apiKey: fromOp, mode: "api_key", source: "1password" });
 			return this.#lastResolved;
 		}
 
 		this.#lastResolved = KEYLESS;
 		return KEYLESS;
+	}
+
+	/**
+	 * Export the key to this process's environment.
+	 *
+	 * omp's own built-in `web_search` resolves a Firecrawl credential through the
+	 * environment, and a restricted subagent (`scout`, `librarian`, anything with
+	 * an explicit `tools:` list) gets that built-in rather than this plugin's
+	 * tools. Seeding the variable in-process is what makes those agents search
+	 * through Firecrawl too. It never leaves this process and is never written to
+	 * disk beyond the `0600` credential cache; set `FIRECRAWL_SEED_ENV=0` to opt out.
+	 */
+	#seed(auth: FirecrawlAuth): FirecrawlAuth {
+		if (auth.apiKey && !process.env.FIRECRAWL_API_KEY && process.env.FIRECRAWL_SEED_ENV !== "0") {
+			process.env.FIRECRAWL_API_KEY = auth.apiKey;
+			this.#seededEnv = auth.apiKey;
+		}
+		return auth;
 	}
 
 	#readCache(): string | undefined {

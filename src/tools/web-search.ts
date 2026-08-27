@@ -1,14 +1,27 @@
 /**
- * `web_search` — Firecrawl `/v2/search` registered over the built-in tool.
+ * `web_search` + `firecrawl_search` — Firecrawl `/v2/search`.
  *
- * Shadowing the built-in name means every existing prompt, skill and subagent
- * that already calls `web_search` routes through Firecrawl with no rewiring.
- * The schema is a superset of the built-in one, and on Firecrawl failure the
- * call is delegated back to the native provider chain via `ctx.invokeTool`,
- * so takeover never makes search strictly worse.
+ * `web_search` shadows the built-in tool, so every existing prompt, skill and
+ * unrestricted subagent that already calls `web_search` routes through
+ * Firecrawl with no rewiring, and on failure the call is delegated back to the
+ * native provider chain via `ctx.invokeTool`.
+ *
+ * `firecrawl_search` registers the same implementation under a name that cannot
+ * collide. A restricted session — an agent with an explicit `tools:` list, or
+ * `--tools web_search` — resolves the *built-in* `web_search`, so those callers
+ * need this alias to reach Firecrawl directly.
  */
 
-import { type FirecrawlDocument, failFrom, type OutputWriter, ok, renderDocument } from "../core/output.ts";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+
+import {
+	type FirecrawlDocument,
+	failFrom,
+	type OutputWriter,
+	ok,
+	renderDocument,
+	type ToolResult,
+} from "../core/output.ts";
 import { scrapeOptionsSchema } from "../core/schema.ts";
 import { compact, defineTool, type FirecrawlToolEnv, type FirecrawlToolModule } from "../core/tool.ts";
 
@@ -124,85 +137,113 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		temperature: z.number().optional().describe("Accepted for built-in compatibility; unused by Firecrawl"),
 	});
 
+	const description =
+		"Search the web through Firecrawl and get ranked results with query-relevant highlights, optionally with full page content. Supports Google operators, domain include/exclude, recency, geo-targeting, and corpus filters (github/research/pdf). Falls back to omp's built-in providers if Firecrawl fails.";
+
+	type SearchParams = typeof parameters extends { readonly _output: infer Out } ? Out : never;
+
+	// One implementation, registered twice. `ctx.invokeTool` is present only for
+	// the `web_search` registration, which is what gates native fallback.
+	const execute = async (
+		_id: string,
+		params: SearchParams,
+		signal: AbortSignal | undefined,
+		_onUpdate: unknown,
+		ctx: ExtensionContext,
+	): Promise<ToolResult> => {
+		const limit = params.limit ?? params.num_search_results;
+		const scrapeOptions = params.scrape
+			? compact({ formats: ["markdown"], onlyMainContent: true, ...(params.scrapeOptions ?? {}) })
+			: params.scrapeOptions
+				? compact(params.scrapeOptions)
+				: undefined;
+
+		const body = compact({
+			query: params.query,
+			limit,
+			sources: params.sources?.map((type) => ({ type })),
+			categories: params.categories?.map((type) => ({ type })),
+			includeDomains: params.includeDomains,
+			excludeDomains: params.excludeDomains,
+			location: params.location,
+			country: params.country,
+			tbs: params.tbs ?? (params.recency ? RECENCY_TBS[params.recency] : undefined),
+			safe: params.safe,
+			highlights: params.highlights,
+			ignoreInvalidURLs: params.ignoreInvalidURLs,
+			timeout: params.timeout,
+			scrapeOptions,
+		});
+
+		try {
+			const response = await client.request<SearchResponse>("/search", {
+				method: "POST",
+				body,
+				signal,
+				timeoutMs: params.timeout ? params.timeout + 15_000 : undefined,
+			});
+			const text = await renderSearch(out, response, params.maxChars);
+			if (text === undefined) {
+				throw new Error(`Firecrawl returned no results for "${params.query}"`);
+			}
+			return ok(text, {
+				provider: "firecrawl",
+				authMode: client.auth.lastResolved.mode,
+				counts: {
+					web: response.data?.web?.length ?? 0,
+					news: response.data?.news?.length ?? 0,
+					images: response.data?.images?.length ?? 0,
+				},
+			});
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			// `invokeTool` exists only for the shadowed `web_search` registration,
+			// so the alias simply reports the failure instead of delegating.
+			const native = ctx.invokeTool;
+			if (params.fallback !== false && native) {
+				const reason = error instanceof Error ? error.message : String(error);
+				const delegated = await native(
+					compact({
+						query: params.query,
+						limit,
+						recency: params.recency === "hour" ? "day" : params.recency,
+						num_search_results: params.num_search_results,
+						max_tokens: params.max_tokens,
+						temperature: params.temperature,
+					}),
+					{ signal },
+				);
+				const head = {
+					type: "text" as const,
+					text: `Note: Firecrawl search failed (${reason}); used omp's built-in providers.`,
+				};
+				return { ...delegated, content: [head, ...delegated.content] };
+			}
+			return failFrom(error, signal);
+		}
+	};
+
 	return [
 		defineTool({
 			name: "web_search",
 			label: "Web Search",
-			description:
-				"Search the web through Firecrawl and get ranked results with query-relevant highlights, optionally with full page content. Supports Google operators, domain include/exclude, recency, geo-targeting, and corpus filters (github/research/pdf). Falls back to omp's built-in providers if Firecrawl fails.",
+			description,
 			parameters,
 			loadMode: "essential",
 			approval: "read",
-			async execute(_id, params, signal, _onUpdate, ctx) {
-				const limit = params.limit ?? params.num_search_results;
-				const scrapeOptions = params.scrape
-					? compact({ formats: ["markdown"], onlyMainContent: true, ...(params.scrapeOptions ?? {}) })
-					: params.scrapeOptions
-						? compact(params.scrapeOptions)
-						: undefined;
-
-				const body = compact({
-					query: params.query,
-					limit,
-					sources: params.sources?.map((type) => ({ type })),
-					categories: params.categories?.map((type) => ({ type })),
-					includeDomains: params.includeDomains,
-					excludeDomains: params.excludeDomains,
-					location: params.location,
-					country: params.country,
-					tbs: params.tbs ?? (params.recency ? RECENCY_TBS[params.recency] : undefined),
-					safe: params.safe,
-					highlights: params.highlights,
-					ignoreInvalidURLs: params.ignoreInvalidURLs,
-					timeout: params.timeout,
-					scrapeOptions,
-				});
-
-				try {
-					const response = await client.request<SearchResponse>("/search", {
-						method: "POST",
-						body,
-						signal,
-						timeoutMs: params.timeout ? params.timeout + 15_000 : undefined,
-					});
-					const text = await renderSearch(out, response, params.maxChars);
-					if (text === undefined) {
-						throw new Error(`Firecrawl returned no results for "${params.query}"`);
-					}
-					return ok(text, {
-						provider: "firecrawl",
-						authMode: client.auth.lastResolved.mode,
-						counts: {
-							web: response.data?.web?.length ?? 0,
-							news: response.data?.news?.length ?? 0,
-							images: response.data?.images?.length ?? 0,
-						},
-					});
-				} catch (error) {
-					if (signal?.aborted) throw error;
-					const native = ctx.invokeTool;
-					if (params.fallback !== false && native) {
-						const reason = error instanceof Error ? error.message : String(error);
-						const delegated = await native(
-							compact({
-								query: params.query,
-								limit,
-								recency: params.recency === "hour" ? "day" : params.recency,
-								num_search_results: params.num_search_results,
-								max_tokens: params.max_tokens,
-								temperature: params.temperature,
-							}),
-							{ signal },
-						);
-						const head = {
-							type: "text" as const,
-							text: `Note: Firecrawl search failed (${reason}); used omp's built-in providers.`,
-						};
-						return { ...delegated, content: [head, ...delegated.content] };
-					}
-					return failFrom(error, signal);
-				}
-			},
+			execute,
+		}),
+		defineTool({
+			// A restricted session (an agent with an explicit `tools:` list, or
+			// `--tools web_search`) resolves the built-in `web_search` rather than
+			// this shadow, so agents need a name that cannot collide.
+			name: "firecrawl_search",
+			label: "Firecrawl Search",
+			description: `${description} Identical to web_search; use this name from agents with an explicit tool list, where the built-in web_search wins.`,
+			parameters,
+			loadMode: "essential",
+			approval: "read",
+			execute,
 		}),
 	];
 };

@@ -45,16 +45,43 @@ alone.
 `firecrawl_scrape` and `firecrawl_developer` are top-level. Everything else is
 discoverable — read `xd://firecrawl_<name>` for the full schema on demand.
 
-One caveat: a **restricted** session (`omp --tools web_search`, or a subagent
-with an explicit tool list) resolves the *built-in* `web_search`, not this one.
-Restricted sessions only receive the tools they name from the built-in
-registry. Unrestricted sessions — the normal case — get the Firecrawl tool.
-Name `firecrawl_scrape`, `firecrawl_developer` and friends in `--tools` to
-reach the plugin explicitly.
+### How every agent reaches Firecrawl
+
+There are three paths, because a subagent's tool set depends on how it was
+declared:
+
+1. **Unrestricted sessions and subagents** (interactive, `omp -p`, the bundled
+   `task` and `sonic` agents) get all 14 tools, including the `web_search`
+   shadow. Nothing to configure.
+2. **Restricted agents** — anything with an explicit `tools:` list, such as the
+   bundled `scout`, `librarian`, `reviewer`, `designer` and
+   `security-reviewer` — resolve the *built-in* `web_search`, not the shadow,
+   because a name that collides with a built-in loses in a restricted registry.
+   Two things cover them:
+   - `firecrawl_search` is the same implementation under a non-colliding name.
+     Name it in an agent's `tools:` list (or in `--tools`) to get the full
+     Firecrawl search surface.
+   - The built-in `web_search` itself is pointed at Firecrawl by
+     `providers.webSearchOrder: ["firecrawl"]` plus the key this plugin exports
+     into the process environment at session start. So even an agent that only
+     knows `web_search` searches through Firecrawl.
+3. **Delegation** — the plugin ships a `web-researcher` agent with the complete
+   Firecrawl surface. Any agent can hand off to it:
+   `task({ context, tasks: [{ agent: "web-researcher", task: "..." }] })`. It
+   returns `{ answer, sources[], files[], gaps }` and refuses mutating or
+   local-file-upload actions unless the task explicitly asks for them.
+
+To make the built-in chain Firecrawl-first on a machine that has not run this
+plugin yet:
+
+```bash
+omp config set providers.webSearchOrder '["firecrawl"]'
+```
 
 | Tool | Endpoints |
 |---|---|
-| `web_search` | `POST /search` |
+| `web_search` | `POST /search` (shadows the built-in) |
+| `firecrawl_search` | `POST /search` (same tool, collision-free name for restricted agents) |
 | `firecrawl_scrape` | `POST /scrape`, `GET /scrape/{jobId}` |
 | `firecrawl_developer` | `POST /search/developer` |
 | `firecrawl_research` | `GET /search/research/papers`, `/{id}`, `/{id}/similar` |

@@ -73,6 +73,25 @@ function formatIds(ids: PaperIdMap | undefined): string | undefined {
 	return pairs.length === 0 ? undefined : pairs.join(", ");
 }
 
+/**
+ * Append repeated query parameters to a path.
+ *
+ * `anchor`, `authors` and `categories` are all documented as "repeat or pass a
+ * comma-separated value". Repeating is the only form that survives a value
+ * containing a comma — author strings such as `Dhariwal, Prafulla` would
+ * otherwise be split into two filters that can never both match. The client's
+ * own query map uses `set`, so repeated keys have to be built here; it merges
+ * the single-valued parameters onto whatever this returns.
+ */
+function withRepeated(path: string, repeated: Record<string, string[] | undefined>): string {
+	const params = new URLSearchParams();
+	for (const [key, values] of Object.entries(repeated)) {
+		for (const value of values ?? []) params.append(key, value);
+	}
+	const query = params.toString();
+	return query === "" ? path : `${path}?${query}`;
+}
+
 function formatSignals(signals: PaperSignals | undefined): string | undefined {
 	if (!signals) return undefined;
 	const parts: string[] = [];
@@ -127,7 +146,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.string()
 			.optional()
 			.describe(
-				"Required for 'paper' and 'related': a canonical paperId or source-specific primaryId such as 'arxiv:2105.05233', 'doi:10.1038/nature14539', 'pmid:12345678' or 'pmcid:PMC1234567'.",
+				"Required for 'paper' and 'related': a canonical paperId or source-specific primaryId such as 'arxiv:2105.05233', 'doi:10.1038/nature14539', 'pmid:12345678' or 'pmcid:PMC1234567'. A 'search' result whose paperId is 'web:<url>' is a SERP-discovered display row with no indexed record, so it cannot be inspected, read or expanded — use its primaryId if it has one.",
 			),
 		intent: z
 			.string()
@@ -144,9 +163,10 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		k: z
 			.number()
 			.int()
+			.min(1)
 			.optional()
 			.describe(
-				"Result cap. For 'search' and 'related': 1-500 papers, default 40. For 'paper' in read mode: passage count, default 4 — and only valid when `query` is present.",
+				"Result cap. For 'search' and 'related': 1-500 papers, default 40. For 'paper' in read mode: passage count, 1-50, default 4 — and only valid when `query` is present.",
 			),
 		rerank: z
 			.boolean()
@@ -162,13 +182,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.array(z.string())
 			.optional()
 			.describe(
-				"'search' only. Author substring filters, sent comma-separated. All filters must match, so multiple entries narrow rather than widen.",
+				"'search' only. Author substring filters, sent as repeated `authors` parameters so names containing a comma stay one filter. All filters must match, so multiple entries narrow rather than widen.",
 			),
 		categories: z
 			.array(z.string())
 			.optional()
 			.describe(
-				"'search' only. Paper category filters (e.g. 'cs.LG'), sent comma-separated. All filters must match, so multiple entries narrow rather than widen.",
+				"'search' only. Paper category filters (e.g. 'cs.LG'), sent as repeated `categories` parameters. All filters must match, so multiple entries narrow rather than widen.",
 			),
 		from: z
 			.string()
@@ -199,17 +219,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 				try {
 					if (action === "search") {
 						if (!query) return fail("Action 'search' requires `query` (the natural-language paper search query).");
-						const response = await client.request<SearchPapersResponse>("/search/research/papers", {
-							query: {
-								query,
-								k,
-								authors: authors && authors.length > 0 ? authors.join(",") : undefined,
-								categories: categories && categories.length > 0 ? categories.join(",") : undefined,
-								from,
-								to,
+						const response = await client.request<SearchPapersResponse>(
+							withRepeated("/search/research/papers", { authors, categories }),
+							{
+								query: { query, k, from, to },
+								signal,
 							},
-							signal,
-						});
+						);
 						const results = response.results ?? [];
 						if (results.length === 0) {
 							return ok(
@@ -283,12 +299,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							"Action 'related' requires `intent` (the natural-language ranking intent for the expanded pool).",
 						);
 					}
-					let path = `/search/research/papers/${encodeURIComponent(id)}/similar`;
-					if (anchors && anchors.length > 0) {
-						const repeated = new URLSearchParams();
-						for (const anchor of anchors) repeated.append("anchor", anchor);
-						path = `${path}?${repeated.toString()}`;
-					}
+					const path = withRepeated(`/search/research/papers/${encodeURIComponent(id)}/similar`, { anchor: anchors });
 					const response = await client.request<SimilarPapersResponse>(path, {
 						query: { intent, mode, k, rerank },
 						signal,

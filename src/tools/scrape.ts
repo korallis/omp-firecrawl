@@ -35,7 +35,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			name: "firecrawl_scrape",
 			label: "Firecrawl Scrape",
 			description:
-				"Scrape one URL into clean data via Firecrawl. Formats: markdown, summary, html, rawHtml, links, images, screenshot, json (schema/prompt extraction), question (ask the page), highlights (query-relevant passages), changeTracking, branding, product, menu, audio, video. Also runs browser actions (click/write/press/scroll/executeJavascript/pdf), parses PDFs and documents, redacts PII, and reuses Firecrawl's cache via maxAge for ~500% faster repeat reads.",
+				"Scrape one URL into clean data via Firecrawl. Formats: markdown, summary, html, rawHtml, rawBase64 (original response bytes, base64; must be the only requested format, MIME type in metadata.contentType), links, images, screenshot, json (schema/prompt extraction), question (ask the page), highlights (query-relevant passages), changeTracking, branding, product, menu, audio, video. Also runs browser actions (click/write/press/scroll/executeJavascript/pdf), parses PDFs and documents, redacts PII, and reuses Firecrawl's cache via maxAge for ~500% faster repeat reads. The reported scrape id can be replayed as `jobId` here or handed to firecrawl_interact to keep acting on the same loaded page.",
 			parameters,
 			approval: "read",
 			async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -57,11 +57,23 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					const doc = response.data;
 					if (!doc) return failFrom(new Error("Firecrawl returned no document"), signal);
 
+					const meta = doc.metadata;
+					// `data.metadata.scrapeId` is the handle for `GET /scrape/{jobId}` and for
+					// `POST /scrape/{jobId}/interact`; without it firecrawl_interact is unreachable.
+					const scrapeId = typeof meta?.scrapeId === "string" ? meta.scrapeId : undefined;
+					const contentType = typeof meta?.contentType === "string" ? meta.contentType : undefined;
+
 					const rendered = await renderDocument(out, doc, { label: url ?? jobId, inlineChars: maxChars });
-					const text = response.warning ? `Note: ${response.warning}\n\n${rendered}` : rendered;
+					const withWarning = response.warning ? `Note: ${response.warning}\n\n${rendered}` : rendered;
+					const text =
+						scrapeId !== undefined && jobId === undefined
+							? `${withWarning}\n\nscrape id: ${scrapeId} — pass it as \`jobId\` to firecrawl_interact to keep acting on this same loaded page, or back to this tool to re-read the stored result.`
+							: withWarning;
 					return ok(text, {
-						url: doc.metadata?.sourceURL ?? url,
-						statusCode: doc.metadata?.statusCode,
+						url: meta?.sourceURL ?? url,
+						scrapeId,
+						statusCode: meta?.statusCode,
+						contentType,
 						formats: Object.keys(doc).filter((key) => key !== "metadata"),
 					});
 				} catch (error) {

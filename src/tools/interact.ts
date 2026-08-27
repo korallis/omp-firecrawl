@@ -169,48 +169,54 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.string()
 			.optional()
 			.describe(
-				"Code to run in the sandbox (1-100000 chars). `page` is a live Playwright Page already attached to the session; the last expression is returned as the result. Screenshot with `(await page.screenshot()).toString('base64')`.",
+				"Code to run in the sandbox (1-100000 chars). The body runs at top level in an async scope, so: `await` freely, but a top-level `return` is a SYNTAX ERROR — end with a bare expression instead, because the value of the LAST expression becomes `result`. Only `page` is pre-bound (a live Playwright Page already attached to this session); `browser` and `context` are NOT bound, so never call `chromium.connect*` or `browser.newPage()`. Wrap multiple values as `JSON.stringify({ a, b })` on the final line. Screenshot with `(await page.screenshot()).toString('base64')` in node, `await page.screenshot(path='/tmp/s.png')` in python, `agent-browser screenshot` in bash. Sandbox exceptions come back as `success: true` with `exitCode: 1` plus `error`/`stderr`, which this tool reports as a failure.",
 			),
 		prompt: z
 			.string()
 			.optional()
 			.describe(
-				"Natural-language task for Firecrawl's browser agent (1-10000 chars), e.g. 'click the first result and report the price'. Only valid for `scrape_execute`, and mutually exclusive with `code`. Keep each prompt to one focused step; session state carries across calls.",
+				"Natural-language task for Firecrawl's browser agent (1-10000 chars), e.g. 'click the first result and report the price'. Only valid for `scrape_execute`, and mutually exclusive with `code`. The agent's answer comes back as `output` (`result` holds the raw page snapshot it used). Keep each prompt to one focused step; session state carries across calls. Prompt-driven sessions bill 7 credits per browser minute instead of the 2 that code-only sessions cost.",
 			),
 		language: z
 			.enum(["node", "python", "bash"])
 			.optional()
 			.describe(
-				"Language of `code`, default 'node' (Playwright JS). 'python' uses Playwright's Python API with `page`; 'bash' has the agent-browser CLI preinstalled. Ignored when `prompt` is used.",
+				"Language of `code`, default 'node' (Playwright JS, `page` pre-bound). 'python' uses Playwright's Python API with the same `page` (print to produce stdout). 'bash' has the agent-browser CLI preinstalled — `agent-browser snapshot -i` lists interactive elements as `@e1`-style refs, then `agent-browser click @e1`, `fill @e1 \"text\"`, `press Enter`, `get text @e1`. Ignored when `prompt` is used.",
 			),
 		timeout: z
 			.number()
 			.int()
 			.optional()
-			.describe("Execution timeout in seconds (1-300). Scrape-bound calls default to 30."),
+			.describe(
+				"Execution timeout in seconds (1-300). Standalone `execute` inherits the sandbox default when omitted; `scrape_execute` defaults to 30, which is usually too short for a multi-step `prompt`. Hitting it returns `killed: true`.",
+			),
 		origin: z.string().optional().describe("Optional origin label for execution telemetry (`scrape_execute` only)"),
 		ttl: z
 			.number()
 			.int()
 			.optional()
-			.describe("`create`: total session lifetime in seconds (30-3600, default 300). Billing runs for this long."),
+			.describe(
+				"`create`: total session lifetime in seconds (30-3600). The OpenAPI spec says the default is 300 while the prose docs say 600 — pass it explicitly if the ceiling matters. Billing runs until the session is deleted or the TTL expires.",
+			),
 		activityTtl: z
 			.number()
 			.int()
 			.optional()
-			.describe("`create`: idle seconds before the session self-destructs (10-3600). Cheap safety net."),
+			.describe("`create`: idle seconds before the session self-destructs (10-3600, default 300). Cheap safety net."),
 		streamWebView: z
 			.boolean()
 			.optional()
-			.describe("`create`: stream a live view of the browser (default true) so the URLs below are watchable"),
+			.describe(
+				"`create`: stream a live view of the browser (default true) so the URLs below are watchable. Setting false drops `liveViewUrl`/`interactiveLiveViewUrl` and leaves only the CDP websocket.",
+			),
 		profile: z
 			.object({
-				name: z.string().describe("Profile name; sessions sharing a name share cookies, localStorage and logins"),
+				name: z.string().describe("Profile name (1-128 chars); same name = shared cookies, localStorage and logins"),
 				saveChanges: z
 					.boolean()
 					.optional()
 					.describe(
-						"Persist browser state back to the profile on close (default true). Many non-saving sessions may run concurrently, but only one saving session at a time.",
+						"Persist browser state back to the profile on close (default true). Many non-saving sessions may run concurrently, but only one saving session at a time — a second saver gets HTTP 409.",
 					),
 			})
 			.optional()
@@ -233,7 +239,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			name: "firecrawl_interact",
 			label: "Firecrawl Interact",
 			description:
-				"Drive a real cloud Chromium session through Firecrawl: run Playwright code, agent-browser CLI commands, or a natural-language prompt against a live page, and watch it over a live-view URL. Prefer this over firecrawl_scrape when a single fetch is not enough — logins, multi-step forms, paginated apps, drop-downs, checkout flows, anything behind a click. Two flavours: standalone sessions (`create` -> `execute` -> `delete`) and sessions bound to an earlier scrape (`scrape_execute` on the scrape id, then `scrape_stop`), which resume from that page's exact state. IMPORTANT: a live session bills continuously for wall-clock time (credits are reported on delete), so always finish with `delete`/`scrape_stop` — do not rely on the TTL. Actions: create, list, execute, delete, scrape_execute, scrape_stop.",
+				"Drive a real cloud Chromium session through Firecrawl: run Playwright code, agent-browser CLI commands, or a natural-language prompt against a live page, and watch it over a live-view URL. Prefer this over firecrawl_scrape when a single fetch is not enough — logins, multi-step forms, paginated apps, drop-downs, checkout flows, anything behind a click. Two flavours: standalone sessions (`create` -> `execute` -> `delete`) and sessions bound to an earlier scrape (`scrape_execute` on the scrape id, then `scrape_stop`), which resume from that page's exact state. IMPORTANT: a live session bills continuously for wall-clock time (2 credits per browser minute for code, 7 with a `prompt`, minimum one minute, credits are reported on delete), so always finish with `delete`/`scrape_stop` — do not rely on the TTL. Actions: create, list, execute, delete, scrape_execute, scrape_stop.",
 			parameters,
 			approval: "exec",
 			async execute(_id, params, signal, onUpdate, _ctx) {
@@ -312,6 +318,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 									`${session.id ?? "(no id)"}  ${session.status ?? "?"}`,
 									`    created: ${session.createdAt ?? "?"}  lastActivity: ${session.lastActivity ?? "?"}`,
 								];
+								if (session.streamWebView !== undefined) {
+									parts.push(`    streamWebView: ${session.streamWebView}`);
+								}
 								if (session.liveViewUrl) parts.push(`    live view: ${session.liveViewUrl}`);
 								if (session.interactiveLiveViewUrl) {
 									parts.push(`    interactive: ${session.interactiveLiveViewUrl}`);
@@ -325,6 +334,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							return ok(`## Interact sessions (${sessions.length})\n${rows.join("\n")}${warning}`, {
 								count: sessions.length,
 								active,
+								ids: sessions.map((session) => session.id),
 							});
 						}
 

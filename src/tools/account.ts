@@ -29,6 +29,23 @@ const ACTIVITY_ENDPOINTS = [
 	"interact",
 ] as const;
 
+/**
+ * Where a listed job's full result lives. `/team/activity` hands back an id and
+ * an endpoint name, and the retrieval path is not derivable from either — batch
+ * scrapes live under `/batch/scrape/{id}` and interact sessions under
+ * `/interact/{sessionId}`. Endpoints absent here have no GET retrieval route:
+ * `search`, `map`, `llmstxt`, `deep_research` and `browser` return their result
+ * inline on the original call.
+ */
+const JOB_RESULT_PATHS: Record<string, string> = {
+	scrape: "GET /v2/scrape/{id}",
+	crawl: "GET /v2/crawl/{id}",
+	batch_scrape: "GET /v2/batch/scrape/{id}",
+	extract: "GET /v2/extract/{id}",
+	agent: "GET /v2/agent/{id}",
+	interact: "GET /v2/interact/{id}",
+};
+
 interface CreditUsageResponse {
 	success?: boolean;
 	data?: {
@@ -116,12 +133,27 @@ interface FeedbackResponse {
 	warning?: string;
 }
 
+/** Documented shape of `validation`; the object is open, so extras pass through. */
+interface SupportValidation {
+	tested?: boolean;
+	result?: "success" | "failure" | "skipped";
+	evidence?: unknown;
+	[key: string]: unknown;
+}
+
+/** Documented shape of `feedback`, present only when the agent gets stuck. */
+interface SupportBlocked {
+	blockedBy?: string;
+	attempted?: unknown;
+	[key: string]: unknown;
+}
+
 interface SupportAskResponse {
 	answer?: string;
 	confidence?: "high" | "medium" | "low";
 	fixParameters?: Record<string, unknown> | null;
-	validation?: Record<string, unknown> | null;
-	feedback?: Record<string, unknown> | null;
+	validation?: SupportValidation | null;
+	feedback?: SupportBlocked | null;
 	durationMs?: number;
 }
 
@@ -153,7 +185,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 				"docs_search",
 			])
 			.describe(
-				"'credits'/'tokens' current balance and billing window; 'credits_history'/'tokens_history' past billing periods; 'queue' concurrency pressure; 'activity' recent job log with ids; 'threat_protection' read the policy; 'set_threat_protection' replace the policy; 'feedback' rate a finished scrape/parse/map/search job; 'search_feedback' rate a /search job by id; 'ask' have the support agent diagnose a failure; 'docs_search' answer a Firecrawl docs question with citations.",
+				"'credits'/'tokens' current balance and billing window; 'credits_history'/'tokens_history' past billing periods; 'queue' concurrency pressure; 'activity' recent job log with ids; 'threat_protection' read the policy; 'set_threat_protection' replace the policy — both are enterprise-gated and answer 403 when Threat Protection is not enabled for the team; 'feedback' rate a finished scrape/parse/map/search job; 'search_feedback' rate a /search job by id; 'ask' have the support agent diagnose a failure; 'docs_search' answer a Firecrawl docs question with citations.",
 			),
 		byApiKey: z
 			.boolean()
@@ -164,8 +196,14 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		endpoint: z
 			.enum([...ACTIVITY_ENDPOINTS])
 			.optional()
-			.describe("'activity' only. Filter the job log to one endpoint."),
-		limit: z.number().int().optional().describe("'activity' only. Maximum jobs per page (default 50)."),
+			.describe("'activity' only. Filter the job log to one endpoint. The log only covers the last 24 hours."),
+		limit: z
+			.number()
+			.int()
+			.min(1)
+			.max(100)
+			.optional()
+			.describe("'activity' only. Maximum jobs per page, 1-100, default 50."),
 		cursor: z
 			.string()
 			.optional()
@@ -223,12 +261,14 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.array(z.string())
 			.optional()
 			.describe(
-				"'feedback' only. Up to 20 short machine-readable issue slugs matching ^[a-z0-9][a-z0-9_-]*$, e.g. 'paywalled', 'js_not_rendered'.",
+				"'feedback' only. Up to 20 short machine-readable issue slugs, each at most 80 characters and matching ^[a-z0-9][a-z0-9_-]*$, e.g. 'paywalled', 'js_not_rendered'.",
 			),
 		tags: z
 			.array(z.string())
 			.optional()
-			.describe("'feedback' only. Up to 20 slugs (same charset as `issues`) for your own categorisation."),
+			.describe(
+				"'feedback' only. Up to 20 slugs (same charset and 80-character limit as `issues`) for your own categorisation.",
+			),
 		note: z.string().optional().describe("'feedback' only. Free-form explanation, max 4000 characters."),
 		url: z.string().optional().describe("'feedback' only. The specific result URL the feedback is about."),
 		pageNumbers: z
@@ -258,7 +298,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 				}),
 			)
 			.optional()
-			.describe("Up to 20 gaps in the result. Expected for a 'bad' rating."),
+			.describe(
+				"Gaps in the result: up to 50 for 'feedback', up to 20 for 'search_feedback'. Expected for a 'bad' rating.",
+			),
 		querySuggestions: z
 			.string()
 			.optional()
@@ -353,9 +395,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							});
 							const periods = response.periods ?? [];
 							if (periods.length === 0) {
-								return ok(`No historical ${isCredits ? "credit" : "token"} usage periods returned.`, {
-									periods: 0,
-								});
+								return ok(`No historical ${isCredits ? "credit" : "token"} usage periods returned.`, { periods });
 							}
 							const rows = periods.map((period) => {
 								const total = isCredits
@@ -366,7 +406,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 								return `${period.startDate ?? "?"} to ${end}: ${total?.toLocaleString("en-US") ?? "unknown"}${key}`;
 							});
 							const header = `## Historical ${isCredits ? "credits" : "tokens"} (${periods.length} periods${byApiKey ? ", per API key" : ""})`;
-							return ok(`${header}\n${rows.join("\n")}`, { periods: periods.length });
+							return ok(`${header}\n${rows.join("\n")}`, { periods });
 						}
 
 						case "queue": {
@@ -379,7 +419,10 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							];
 							return ok(lines.join("\n"), {
 								jobsInQueue: response.jobsInQueue,
+								activeJobsInQueue: response.activeJobsInQueue,
+								waitingJobsInQueue: response.waitingJobsInQueue,
 								maxConcurrency: response.maxConcurrency,
+								mostRecentSuccess: response.mostRecentSuccess,
 							});
 						}
 
@@ -402,14 +445,16 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 									`created: ${job.created_at ?? "?"}`,
 								];
 								if (job.target) parts.push(`target: ${job.target}`);
+								const retrieval = job.endpoint === undefined ? undefined : JOB_RESULT_PATHS[job.endpoint];
+								if (retrieval && job.id) parts.push(`fetch: ${retrieval.replace("{id}", job.id)}`);
 								return parts.join(" | ");
 							});
 							const paging = response.has_more
 								? `More results available — call again with cursor: ${response.cursor ?? "(missing)"}`
 								: "End of results (no further cursor).";
 							const text = [
-								`## Recent activity (${jobs.length} jobs${endpoint ? `, endpoint '${endpoint}'` : ""})`,
-								"Fetch a job's full result with the GET endpoint matching its `endpoint` and `id`.",
+								`## Recent activity, last 24 hours (${jobs.length} jobs${endpoint ? `, endpoint '${endpoint}'` : ""})`,
+								"Each row's `fetch` field is the exact call that returns that job's full result. Rows without one — search, map, llmstxt, deep_research, browser — have no GET retrieval route.",
 								await out.section("firecrawl-activity", rows.join("\n"), maxChars),
 								paging,
 							].join("\n\n");
@@ -552,13 +597,20 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 								);
 							}
 							if (response.validation) {
+								// `tested`/`result` decide whether the fix above is proven or merely
+								// suggested, so they belong in the heading rather than buried in JSON.
+								const verdict = [
+									response.validation.tested === undefined ? undefined : `tested: ${response.validation.tested}`,
+									response.validation.result ? `result: ${response.validation.result}` : undefined,
+								].filter((part): part is string => part !== undefined);
 								sections.push(
-									`### Validation\n${await out.section("firecrawl-support-validation", stringify(response.validation), maxChars, "json")}`,
+									`### Validation${verdict.length > 0 ? ` (${verdict.join(", ")})` : ""}\n${await out.section("firecrawl-support-validation", stringify(response.validation), maxChars, "json")}`,
 								);
 							}
 							if (response.feedback) {
+								const blocker = response.feedback.blockedBy ? ` — blocked by ${response.feedback.blockedBy}` : "";
 								sections.push(
-									`### Agent needs more information\n${await out.section("firecrawl-support-feedback", stringify(response.feedback), maxChars, "json")}`,
+									`### Agent needs more information${blocker}\n${await out.section("firecrawl-support-feedback", stringify(response.feedback), maxChars, "json")}`,
 								);
 							}
 							if (response.durationMs !== undefined) {
@@ -567,7 +619,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 							return ok(sections.join("\n\n"), {
 								confidence: response.confidence,
 								fixParameters: response.fixParameters,
+								validation: response.validation,
 								blocked: Boolean(response.feedback),
+								durationMs: response.durationMs,
 							});
 						}
 

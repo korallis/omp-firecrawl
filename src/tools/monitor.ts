@@ -57,11 +57,18 @@ interface MonitorRecord {
 	currentCheckId?: string;
 	targets?: MonitorTargetView[];
 	goal?: string;
+	/** Bumped whenever `goal` or a search target's `queries` change; invalidates prior judge verdicts. */
+	goalVersion?: number;
 	judgeEnabled?: boolean;
 	retentionDays?: number;
 	estimatedCreditsPerMonth?: number | null;
 	lastCheckSummary?: CheckCounts | null;
-	webhook?: { url?: string; events?: string[] } | null;
+	webhook?: {
+		url?: string;
+		events?: string[];
+		headers?: Record<string, string>;
+		metadata?: Record<string, unknown>;
+	} | null;
 	notification?: { email?: { enabled?: boolean; recipients?: string[]; includeDiffs?: boolean } } | null;
 	createdAt?: string;
 	updatedAt?: string;
@@ -202,9 +209,15 @@ function renderMonitorDetail(monitor: MonitorRecord): string {
 		`status: ${monitor.status ?? "?"}   schedule: ${describeSchedule(monitor.schedule)}`,
 		`nextRunAt: ${monitor.nextRunAt ?? "-"}   lastRunAt: ${monitor.lastRunAt ?? "-"}`,
 	];
+	if (monitor.createdAt || monitor.updatedAt) {
+		lines.push(`createdAt: ${monitor.createdAt ?? "?"}   updatedAt: ${monitor.updatedAt ?? "?"}`);
+	}
 	if (monitor.currentCheckId) lines.push(`check in flight: ${monitor.currentCheckId}`);
 	if (monitor.goal) lines.push(`goal: ${monitor.goal}`);
 	if (monitor.judgeEnabled !== undefined) lines.push(`judgeEnabled: ${monitor.judgeEnabled}`);
+	if (monitor.goalVersion !== undefined) {
+		lines.push(`goalVersion: ${monitor.goalVersion} (bumped by goal/queries edits; older judge verdicts are stale)`);
+	}
 	if (monitor.retentionDays !== undefined) lines.push(`retentionDays: ${monitor.retentionDays}`);
 	if (monitor.estimatedCreditsPerMonth !== undefined && monitor.estimatedCreditsPerMonth !== null) {
 		lines.push(`estimatedCreditsPerMonth (upper bound): ${monitor.estimatedCreditsPerMonth}`);
@@ -213,11 +226,16 @@ function renderMonitorDetail(monitor: MonitorRecord): string {
 	if (monitor.webhook?.url) {
 		const events = monitor.webhook.events?.join(", ") ?? "all monitor events";
 		lines.push(`webhook: ${monitor.webhook.url} [${events}]`);
+		// Header values can carry shared secrets, so only their names are echoed.
+		if (monitor.webhook.headers) {
+			lines.push(`    headers: ${Object.keys(monitor.webhook.headers).join(", ") || "(none)"}`);
+		}
+		if (monitor.webhook.metadata) lines.push(`    metadata: ${JSON.stringify(monitor.webhook.metadata)}`);
 	}
 	const email = monitor.notification?.email;
 	if (email) {
 		lines.push(
-			`email: enabled=${email.enabled ?? false} includeDiffs=${email.includeDiffs ?? false} recipients=${email.recipients?.join(", ") ?? "none"}`,
+			`email: enabled=${email.enabled ?? false} includeDiffs=${email.includeDiffs ?? false} recipients=${email.recipients?.join(", ") ?? "team alert list"}`,
 		);
 	}
 
@@ -233,7 +251,9 @@ function renderMonitorDetail(monitor: MonitorRecord): string {
 		if (target.includeDomains) body.push(`includeDomains: ${target.includeDomains.join(", ")}`);
 		if (target.excludeDomains) body.push(`excludeDomains: ${target.excludeDomains.join(", ")}`);
 		if (target.crawlOptions) body.push(`crawlOptions: ${JSON.stringify(target.crawlOptions)}`);
-		if (target.scrapeOptions?.formats) body.push(`formats: ${JSON.stringify(target.scrapeOptions.formats)}`);
+		// Whole object, not just `formats`: `update` replaces targets wholesale, so
+		// the caller needs every option back to edit one of them.
+		if (target.scrapeOptions) body.push(`scrapeOptions: ${JSON.stringify(target.scrapeOptions)}`);
 		lines.push(body.length > 0 ? `${head}\n    ${body.join("\n    ")}` : head);
 	}
 	if ((monitor.targets ?? []).length === 0) lines.push("(none)");
@@ -241,18 +261,22 @@ function renderMonitorDetail(monitor: MonitorRecord): string {
 }
 
 function renderCheckRows(checks: MonitorCheckRecord[]): string {
-	const rows: string[] = ["id | status | trigger | scheduledFor | finishedAt | credits | pages"];
+	const rows: string[] = [
+		"id | status | trigger | scheduledFor | startedAt | finishedAt | credits est/reserved/actual | billing | pages | error",
+	];
 	for (const check of checks) {
-		const credits = check.actualCredits ?? check.reservedCredits ?? check.estimatedCredits ?? "-";
 		rows.push(
 			[
 				check.id ?? "(no id)",
 				check.status ?? "?",
 				check.trigger ?? "?",
 				check.scheduledFor ?? "-",
+				check.startedAt ?? "-",
 				check.finishedAt ?? "-",
-				String(credits),
+				`${check.estimatedCredits ?? "-"}/${check.reservedCredits ?? "-"}/${check.actualCredits ?? "-"}`,
+				check.billingStatus ?? "-",
 				describeCounts(check.summary),
+				check.error ?? "-",
 			].join(" | "),
 		);
 	}
@@ -273,10 +297,14 @@ async function renderCheckDetail(
 		`## Check ${check.id ?? "(no id)"} of monitor ${check.monitorId ?? "?"}`,
 		`status: ${check.status ?? "?"}   trigger: ${check.trigger ?? "?"}`,
 		`scheduledFor: ${check.scheduledFor ?? "-"}   startedAt: ${check.startedAt ?? "-"}   finishedAt: ${check.finishedAt ?? "-"}`,
+		`createdAt: ${check.createdAt ?? "-"}   updatedAt: ${check.updatedAt ?? "-"}`,
 		`pages: ${describeCounts(check.summary)}`,
 		`credits: estimated=${check.estimatedCredits ?? "-"} reserved=${check.reservedCredits ?? "-"} actual=${check.actualCredits ?? "-"} billing=${check.billingStatus ?? "-"}`,
 	];
 	if (check.error) header.push(`error: ${check.error}`);
+	if (check.notificationStatus !== undefined && check.notificationStatus !== null) {
+		header.push(`notifications: ${JSON.stringify(check.notificationStatus)}`);
+	}
 
 	const pages = check.pages ?? [];
 	const rows: string[] = [];
@@ -288,6 +316,20 @@ async function renderCheckDetail(
 		if (page.error) bits.push(`error: ${page.error}`);
 		const searchStatus = page.metadata?.searchStatus;
 		if (typeof searchStatus === "string") bits.push(`searchStatus: ${searchStatus}`);
+		const identity: string[] = [];
+		if (page.id) identity.push(`pageId: ${page.id}`);
+		if (page.targetId) identity.push(`targetId: ${page.targetId}`);
+		if (page.createdAt) identity.push(`checkedAt: ${page.createdAt}`);
+		if (page.previousScrapeId || page.currentScrapeId) {
+			identity.push(`scrapeIds: ${page.previousScrapeId ?? "-"} -> ${page.currentScrapeId ?? "-"}`);
+		}
+		if (identity.length > 0) bits.push(identity.join("  "));
+		if (page.metadata) {
+			// `searchStatus` already has its own line; the rest (title, creditsUsed,
+			// goalVersion, ...) would otherwise be dropped entirely.
+			const extra = Object.entries(page.metadata).filter(([key]) => key !== "searchStatus");
+			if (extra.length > 0) bits.push(`metadata: ${JSON.stringify(Object.fromEntries(extra))}`);
+		}
 		if (page.judgment) {
 			bits.push(
 				`judge: meaningful=${page.judgment.meaningful ?? "?"} confidence=${page.judgment.confidence ?? "?"}${page.judgment.reason ? ` — ${page.judgment.reason}` : ""}`,
@@ -315,6 +357,13 @@ async function renderCheckDetail(
 	if (rows.length > 0) blocks.push(`### Page results (${pages.length})\n${rows.join("\n")}`);
 	else blocks.push("No page results on this check yet.");
 
+	if (check.targetResults && check.targetResults.length > 0) {
+		const document = stringify(check.targetResults);
+		blocks.push(
+			`### Per-target results\n${await out.section(`monitor-check-${check.id ?? "targets"}-targets`, document, options.maxChars)}`,
+		);
+	}
+
 	if (diffSections.length > 0) {
 		const document = diffSections.join("\n\n---\n\n");
 		const budget = options.maxChars ?? out.inlineChars;
@@ -340,11 +389,11 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 	const scrapeTarget = z.object({
 		type: z.literal("scrape").describe("Watch a fixed list of pages"),
 		id: z.string().optional().describe("Stable target id; generated when omitted"),
-		urls: z.array(z.string()).describe("Pages to re-scrape on every check"),
+		urls: z.array(z.string()).describe("Pages to re-scrape on every check (at least 1)"),
 		scrapeOptions: scrapeOptionsSchema(z)
 			.optional()
 			.describe(
-				"How each page is scraped. Include a `changeTracking` format (optionally with a JSON schema/prompt) to get per-field JSON diffs instead of markdown diffs.",
+				"How each page is scraped. Monitor scrapes force `maxAge: 0` (a fresh fetch every check) unless you set `maxAge` here. Include a `changeTracking` format (optionally with a JSON schema/prompt) to get per-field JSON diffs instead of markdown diffs; `modes: ['json','git-diff']` returns both plus a `snapshot`.",
 			),
 	});
 
@@ -355,14 +404,22 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		crawlOptions: z
 			.record(z.string(), z.unknown())
 			.optional()
-			.describe("Crawl controls such as `limit`, `maxDepth`, `includePaths`, `excludePaths`"),
-		scrapeOptions: scrapeOptionsSchema(z).optional().describe("How each crawled page is scraped"),
+			.describe(
+				"Crawl controls, same vocabulary as firecrawl_crawl's `start`: `limit`, `maxDiscoveryDepth`, `maxDepth`, `includePaths`, `excludePaths`, `regexOnFullURL`, `sitemap`, `ignoreQueryParameters`, `crawlEntireDomain`, `allowExternalLinks`, `allowSubdomains`, `ignoreRobotsTxt`, `robotsUserAgent`, `delay`, `maxConcurrency`. Every discovered page costs 1 credit per check, so keep `limit` tight.",
+			),
+		scrapeOptions: scrapeOptionsSchema(z)
+			.optional()
+			.describe("How each crawled page is scraped. Monitor scrapes force `maxAge: 0` unless you override it here."),
 	});
 
 	const searchTarget = z.object({
 		type: z.literal("search").describe("Web-scale watch: run queries and alert on new results"),
 		id: z.string().optional().describe("Stable target id; generated when omitted"),
-		queries: z.array(z.string()).describe("Search queries to run on each check (1-12)"),
+		queries: z
+			.array(z.string())
+			.describe(
+				"Search queries to run on each check (1-12, each up to 256 chars). Write keywords, not sentences; quote multi-word entities and use OR for synonyms. Keep `site:`/`-site:` out — use `includeDomains`/`excludeDomains`. Credits are billed on raw results per query before dedupe, so extra queries cost extra.",
+			),
 		searchWindow: z
 			.enum(["5m", "15m", "1h", "6h", "24h", "7d"])
 			.optional()
@@ -371,9 +428,17 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.number()
 			.int()
 			.optional()
-			.describe("Combined results evaluated per check, deduped across queries (1-50, default 10)"),
-		includeDomains: z.array(z.string()).optional().describe("Restrict results to these domains"),
-		excludeDomains: z.array(z.string()).optional().describe("Drop results from these domains"),
+			.describe(
+				"Combined results evaluated per check, merged and deduped across queries (1-50, default 10). A combined cap, not per-query: one query can fill it.",
+			),
+		includeDomains: z
+			.array(z.string())
+			.optional()
+			.describe("Restrict results to these domains (max 50). Mutually exclusive with `excludeDomains`."),
+		excludeDomains: z
+			.array(z.string())
+			.optional()
+			.describe("Drop results from these domains (max 50). Mutually exclusive with `includeDomains`."),
 	});
 
 	const parameters = z.object({
@@ -384,7 +449,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			),
 		monitorId: z.string().optional().describe("Monitor id. Required for get, update, delete, run, checks and check."),
 		checkId: z.string().optional().describe("Check id. Required for action 'check'."),
-		name: z.string().optional().describe("Human-readable monitor name. Required for 'create'."),
+		name: z.string().optional().describe("Human-readable monitor name (max 256 chars). Required for 'create'."),
 		schedule: z
 			.object({
 				cron: z
@@ -395,9 +460,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					.string()
 					.optional()
 					.describe(
-						"Natural-language schedule: 'every 30 minutes', 'every 15 minutes starting at :07', 'hourly', 'every 2 hours', 'daily', 'daily at 9am', 'daily at 5:30 PM', 'weekly'.",
+						"Natural-language schedule: 'every 30 minutes', 'every 15 minutes starting at :07', 'hourly', 'every 2 hours', 'daily', 'daily at 9am', 'daily at 5:30 PM', 'weekly'. Firecrawl normalizes it to cron (and spreads text schedules by monitor id so they do not all fire at once), so responses show `cron`, not the text you sent.",
 					),
-				timezone: z.string().optional().describe("IANA timezone for the schedule, default 'UTC'"),
+				timezone: z
+					.string()
+					.optional()
+					.describe("IANA timezone for the schedule, default 'UTC'. Controls when phrases like 'daily at 9am' run."),
 			})
 			.optional()
 			.describe("Check cadence. Provide exactly one of `cron` or `text`. Required for 'create'."),
@@ -405,7 +473,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.array(z.union([scrapeTarget, crawlTarget, searchTarget]))
 			.optional()
 			.describe(
-				"What to watch (1-50 targets): 'scrape' for specific pages, 'crawl' for a whole site, 'search' for web-scale query watching. Required for 'create'.",
+				"What to watch (1-50 targets, kinds may be mixed in one monitor): 'scrape' for specific pages, 'crawl' for a whole site, 'search' for web-scale query watching. Required for 'create'.",
 			),
 		webhook: z
 			.object({
@@ -416,7 +484,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					.array(z.enum(["monitor.page", "monitor.check.completed"]))
 					.optional()
 					.describe(
-						"Events to receive: 'monitor.page' fires per changed page, 'monitor.check.completed' fires once per check. Omit for both.",
+						"Events to receive: 'monitor.page' fires per changed page (carries `isMeaningful`, `judgment` and the page `diff`), 'monitor.check.completed' fires once per check with status and summary counts. Omit for both.",
 					),
 			})
 			.optional()
@@ -426,27 +494,37 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 				email: z
 					.object({
 						enabled: z.boolean().optional().describe("Send email summaries (default false)"),
-						recipients: z.array(z.string()).optional().describe("Email recipients (max 25)"),
+						recipients: z
+							.array(z.string())
+							.optional()
+							.describe(
+								"Email recipients (max 25). Omit to mail the team members eligible for system alerts. A new external recipient must confirm via emailed link before delivery starts; existing team members need no confirmation.",
+							),
 						includeDiffs: z
 							.boolean()
 							.optional()
-							.describe("Include changed page details in the email body (default false)"),
+							.describe(
+								"Include changed page details in the email body (default false). Email is only sent when a check has changed/new/removed/errored pages.",
+							),
 					})
-					.optional(),
+					.optional()
+					.describe("Email summaries for checks that found something"),
 			})
 			.optional()
-			.describe("Email notification config"),
+			.describe(
+				"Email notification config. Slack delivery exists but is dashboard-only — it cannot be configured through this API.",
+			),
 		goal: z
 			.string()
 			.optional()
 			.describe(
-				"Plain-language goal used to judge whether a change matters, e.g. 'alert only when pricing changes'. Supplying it turns judging on automatically unless `judgeEnabled` says otherwise. Required (non-empty) when any target is a 'search' target.",
+				"Plain-language goal used to judge whether a change matters (max 2000 chars), e.g. 'alert only when pricing changes'. Supplying it turns judging on automatically unless `judgeEnabled` says otherwise. Required (non-empty) when any target is a 'search' target. Editing it bumps the monitor's `goalVersion`, so results are re-judged lazily as they resurface.",
 			),
 		judgeEnabled: z
 			.boolean()
 			.optional()
 			.describe(
-				"Judge changed pages against `goal` with an LLM. Needs a non-empty `goal`; judge credits apply only to changed pages.",
+				"Judge changed pages against `goal` with an LLM. Needs a non-empty `goal`; judge credits apply only to changed pages (1 credit each, or 1 per judged result for search targets).",
 			),
 		retentionDays: z
 			.number()
@@ -471,7 +549,9 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 		pageStatus: z
 			.enum(["same", "new", "changed", "removed", "error"])
 			.optional()
-			.describe("'check' only: filter page results, e.g. 'changed' to skip unchanged pages"),
+			.describe(
+				"'check' only: filter page results, e.g. 'changed' to skip unchanged pages. For search targets the finer disposition is in each page's `metadata.searchStatus` (alert/already_seen/watching/ignored/skipped).",
+			),
 		wait: z
 			.boolean()
 			.optional()
@@ -512,6 +592,14 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 				}
 				if (action === "check" && !checkId) {
 					return fail("Action 'check' requires `checkId`. Use action 'checks' to list check ids for this monitor.");
+				}
+				// Mutually exclusive on the API side; a 400 here is worth pre-empting.
+				for (const target of params.targets ?? []) {
+					if (target.type === "search" && target.includeDomains && target.excludeDomains) {
+						return fail(
+							"A 'search' target takes either `includeDomains` or `excludeDomains`, not both. Pick the direction that describes the intent.",
+						);
+					}
 				}
 				if (action === "create") {
 					if (!params.name) return fail("Action 'create' requires `name`.");

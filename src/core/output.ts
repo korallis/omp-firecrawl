@@ -7,13 +7,16 @@
  */
 import { mkdir, writeFile } from "node:fs/promises";
 
+import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
+
 import { FirecrawlError } from "./client.ts";
 
-export interface ToolResult {
-	content: Array<{ type: "text"; text: string }>;
-	details?: unknown;
-	isError?: boolean;
-}
+/**
+ * The host's own tool-result contract. Aliased rather than redeclared so a
+ * delegated built-in result (which may carry image blocks) passes straight
+ * through without a cast.
+ */
+export type ToolResult = AgentToolResult;
 
 export interface SpillResult {
 	path: string;
@@ -43,6 +46,13 @@ export interface FirecrawlDocument {
 	changeTracking?: Record<string, unknown>;
 	pages?: Array<{ pageNumber?: number; markdown?: string }>;
 	blocks?: unknown;
+	/** Present only when the request supplied `actions`; ordered per action. */
+	actions?: {
+		screenshots?: string[];
+		scrapes?: Array<{ url?: string; html?: string }>;
+		javascriptReturns?: Array<{ type?: string; value?: unknown }>;
+		pdfs?: string[];
+	} | null;
 	warning?: string;
 	metadata?: Record<string, unknown> & {
 		title?: string;
@@ -53,6 +63,15 @@ export interface FirecrawlDocument {
 		numPages?: number;
 		totalPages?: number;
 		error?: string;
+		/** MIME type; required to interpret `rawBase64`. */
+		contentType?: string;
+		language?: string;
+		keywords?: string;
+		/** True when the request waited on the team's concurrency limit. */
+		concurrencyLimited?: boolean;
+		concurrencyQueueDurationMs?: number;
+		/** Live-only field; the handle for `firecrawl_interact` and job replay. */
+		scrapeId?: string;
 	};
 }
 
@@ -127,7 +146,19 @@ export async function renderDocument(
 				: `pages: ${meta.numPages}`,
 		);
 	}
+	// `contentType` is the only way to interpret `rawBase64`; the concurrency
+	// fields explain a slow call that was queued rather than slow to fetch.
+	if (meta.contentType) facts.push(`content-type: ${meta.contentType}`);
+	if (meta.language) facts.push(`language: ${meta.language}`);
+	if (meta.concurrencyLimited) {
+		const queued =
+			meta.concurrencyQueueDurationMs === undefined
+				? ""
+				: ` (queued ${(meta.concurrencyQueueDurationMs / 1_000).toFixed(1)}s)`;
+		facts.push(`concurrency limited${queued}`);
+	}
 	if (facts.length > 0) lines.push(facts.join(" | "));
+	if (meta.keywords) lines.push(`keywords: ${meta.keywords}`);
 	if (meta.error) lines.push(`error: ${meta.error}`);
 	if (doc.warning) lines.push(`warning: ${doc.warning}`);
 
@@ -173,6 +204,33 @@ export async function renderDocument(
 	if (doc.rawHtml) {
 		const { path } = await writer.spill(`${url}-raw`, doc.rawHtml, "html");
 		lines.push(`\n### Raw HTML\nSaved to ${path} (${doc.rawHtml.length} chars)`);
+	}
+	if (doc.rawBase64) {
+		// A bare Base64 body, not a data URI; `metadata.contentType` names the type.
+		const spilled = await writer.spill(`${url}-rawbase64`, doc.rawBase64, "b64");
+		lines.push(
+			`\n### Raw response body (base64)\n${(spilled.bytes / 1024).toFixed(0)}KB of base64${
+				meta.contentType ? ` for ${meta.contentType}` : ""
+			} saved to ${spilled.path}\nDecode it with: base64 -d ${spilled.path} > out.bin`,
+		);
+	}
+	if (doc.actions) {
+		const rows: string[] = [];
+		for (const [position, shot] of (doc.actions.screenshots ?? []).entries()) {
+			rows.push(`screenshot[${position}]: ${shot} (expires in 24h)`);
+		}
+		for (const [position, pdf] of (doc.actions.pdfs ?? []).entries()) {
+			rows.push(`pdf[${position}]: ${pdf}`);
+		}
+		for (const [position, value] of (doc.actions.javascriptReturns ?? []).entries()) {
+			rows.push(`javascript[${position}] (${value.type ?? "unknown"}): ${stringify(value.value).slice(0, 500)}`);
+		}
+		for (const [position, scrape] of (doc.actions.scrapes ?? []).entries()) {
+			const html = scrape.html ?? "";
+			const spilled = html === "" ? undefined : await writer.spill(`${url}-action-${position}`, html, "html");
+			rows.push(`scrape[${position}]: ${scrape.url ?? "(no url)"}${spilled ? ` — HTML saved to ${spilled.path}` : ""}`);
+		}
+		if (rows.length > 0) lines.push(`\n### Action results\n${rows.join("\n")}`);
 	}
 	if (doc.links && doc.links.length > 0) {
 		const shown = doc.links.slice(0, 50);

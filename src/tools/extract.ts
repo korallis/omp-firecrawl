@@ -5,9 +5,15 @@
  * discovers pages under each pattern, scrapes them and folds the result into a
  * single JSON object shaped by `prompt` and/or `schema`. Asynchronous, so the
  * tool starts a job and polls it, or hands back the job id when `wait: false`.
+ *
+ * The endpoint is in maintenance mode. Every status read carries a `warning`
+ * pointing at `/v2/scrape` json mode (and sometimes a `replacement` endpoint);
+ * both are rendered verbatim so a caller who sees them knows the job itself is
+ * fine. `urls` is optional server-side — `prompt` alone is enough — but the
+ * URL-less path is alpha and `firecrawl_agent` does it better.
  */
 import { fail, failFrom, type OutputWriter, ok, stringify } from "../core/output.ts";
-import { scrapeOptionsSchema, threatProtectionSchema } from "../core/schema.ts";
+import { scrapeOptionsSchema, threatProtectionSchema, webhookSchema } from "../core/schema.ts";
 import { compact, defineTool, type FirecrawlToolEnv, type FirecrawlToolModule } from "../core/tool.ts";
 
 interface ExtractStartResponse {
@@ -25,12 +31,20 @@ interface ExtractStatusResponse {
 	data?: unknown;
 	/** Field-path -> supporting URLs, only when `showSources` was set. */
 	sources?: Record<string, unknown>;
+	/** Per-URL discovery and scrape decisions, only when `urlTrace` was set. */
+	urlTrace?: unknown[];
+	/** Browser sessions the extraction opened, when it opened any. */
+	sessionIds?: string[];
 	error?: string;
 	warning?: string;
 	warnings?: string[];
+	/** Endpoint the deprecation warning steers callers to, e.g. `/v2/scrape`. */
+	replacement?: string;
 	expiresAt?: string;
 	tokensUsed?: number;
 	creditsUsed?: number;
+	/** Echoed by some status reads; otherwise only the start response carries it. */
+	invalidURLs?: string[];
 	next?: string | null;
 }
 
@@ -40,6 +54,7 @@ async function renderExtract(
 	id: string,
 	response: ExtractStatusResponse,
 	maxChars: number | undefined,
+	startInvalidURLs: string[] | undefined,
 ): Promise<string> {
 	const lines = [`## Extract ${id}`];
 
@@ -49,9 +64,16 @@ async function renderExtract(
 	if (response.expiresAt) facts.push(`expires: ${response.expiresAt}`);
 	lines.push(facts.join(" | "));
 
+	const rejected = response.invalidURLs ?? startInvalidURLs;
+	if (rejected && rejected.length > 0) lines.push(`ignored invalid URLs: ${rejected.join(", ")}`);
+	if (response.sessionIds && response.sessionIds.length > 0) {
+		lines.push(`browser sessions: ${response.sessionIds.join(", ")}`);
+	}
+
 	if (response.error) lines.push(`error: ${response.error}`);
 	if (response.warning) lines.push(`warning: ${response.warning}`);
 	for (const warning of response.warnings ?? []) lines.push(`warning: ${warning}`);
+	if (response.replacement) lines.push(`recommended replacement: ${response.replacement}`);
 
 	if (response.data !== undefined && response.data !== null) {
 		lines.push(`\n### Data\n${await out.section(`extract-${id}-data`, stringify(response.data), maxChars, "json")}`);
@@ -62,6 +84,12 @@ async function renderExtract(
 	if (response.sources && Object.keys(response.sources).length > 0) {
 		lines.push(
 			`\n### Sources\n${await out.section(`extract-${id}-sources`, stringify(response.sources), maxChars, "json")}`,
+		);
+	}
+
+	if (response.urlTrace && response.urlTrace.length > 0) {
+		lines.push(
+			`\n### URL trace\n${await out.section(`extract-${id}-urltrace`, stringify(response.urlTrace), maxChars, "json")}`,
 		);
 	}
 
@@ -81,13 +109,13 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.array(z.string())
 			.optional()
 			.describe(
-				"Required for 'start'. URLs or glob patterns to extract from, e.g. 'https://example.com/*' to crawl the whole site, 'https://example.com/blog/*' for a section, or a plain URL for one page. Wildcards make the job much slower and more expensive.",
+				"URLs or glob patterns to extract from, e.g. 'https://example.com/*' to crawl the whole site, 'https://example.com/blog/*' for a section, or a plain URL for one page. Maximum 10 entries per request while the endpoint is in beta. Wildcards make the job much slower and more expensive, so pair them with `limit`. Omit it entirely and pass only `prompt` to let Firecrawl find the pages itself — an alpha path that firecrawl_agent handles far better.",
 			),
 		prompt: z
 			.string()
 			.optional()
 			.describe(
-				"Natural-language description of the data to extract. Required unless `schema` is given; supplying both gives the most reliable output.",
+				"Natural-language description of the data to extract, max 10000 characters. Required unless `schema` is given, and required whenever `urls` is omitted; supplying prompt and schema together gives the most reliable output.",
 			),
 		schema: z
 			.record(z.string(), z.unknown())
@@ -99,19 +127,26 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.string()
 			.optional()
 			.describe(
-				"System-level instruction prepended to the extraction model, e.g. tone, units, canonicalization rules.",
+				"System-level instruction prepended to the extraction model, e.g. tone, units, canonicalization rules. Max 10000 characters.",
+			),
+		limit: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				"Cap how many discovered pages the job extracts from after wildcard expansion. Unlimited when unset — the main cost control for patterns like 'https://example.com/*'.",
 			),
 		allowExternalLinks: z
 			.boolean()
 			.optional()
 			.describe(
-				"Follow links that leave the domains in `urls` when the answer is not on-site. Default false; enabling it widens crawl cost.",
+				"Follow links that leave the domains in `urls` when the answer is not on-site. Default false; enabling it widens crawl cost. Setting `enableWebSearch` turns this on implicitly.",
 			),
 		enableWebSearch: z
 			.boolean()
 			.optional()
 			.describe(
-				"Let the extractor run web searches to fill fields the given pages do not cover. Default false; adds latency and credits.",
+				"Let the extractor run web searches to fill fields the given pages do not cover. Default false; adds latency and credits, and implies `allowExternalLinks`.",
 			),
 		ignoreSitemap: z
 			.boolean()
@@ -124,6 +159,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.describe(
 				"Return the URLs each extracted value came from, under `sources` in the result. Default false. Set it whenever the answer must be citable.",
 			),
+		urlTrace: z
+			.boolean()
+			.optional()
+			.describe(
+				"Return a per-URL record of what the job discovered, scraped, skipped or failed on, under `urlTrace`. Default false; the cheapest way to see why a wildcard pattern produced nothing.",
+			),
 		scrapeOptions: scrapeOptionsSchema(z)
 			.optional()
 			.describe(
@@ -135,16 +176,32 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.describe(
 				"Drop unparseable entries in `urls` and extract from the rest, returning the rejects as `invalidURLs`. Default true; false fails the whole request instead.",
 			),
+		timeout: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				"Server-side ceiling in ms for the whole extraction, minimum 1000. Distinct from `waitTimeoutMs`, which only bounds how long this tool polls; the job keeps running when polling stops but not when this expires.",
+			),
 		agent: z
 			.object({
 				model: z
-					.enum(["FIRE-1", "v3-beta"])
-					.describe("'FIRE-1' drives a real browser during extraction; 'v3-beta' is the newer agentic extractor."),
+					.enum(["FIRE-1"])
+					.describe(
+						"'FIRE-1' drives a real browser during extraction. The former 'v3-beta' model is rejected here with a 400 telling you to call /agent instead — use firecrawl_agent.",
+					),
 			})
 			.optional()
 			.describe(
 				"Opt into agentic extraction for pages that need interaction (pagination, tabs, logins). Substantially slower and more expensive — for genuinely multi-step navigation prefer `firecrawl_agent`.",
 			),
+		webhook: webhookSchema(z)
+			.optional()
+			.describe(
+				"Webhook target for this job's started/page/completed/failed events, so a long extraction need not be polled. `x-firecrawl-signature` is reserved and rejected as a header name.",
+			),
+		origin: z.string().optional().describe("Origin identifier recorded for analytics and logging. Default 'api'."),
+		integration: z.string().optional().describe("Optional integration identifier recorded with the request"),
 		threatProtection: threatProtectionSchema(z)
 			.optional()
 			.describe("Per-request Threat Protection override applied to every URL this job touches."),
@@ -166,7 +223,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			.number()
 			.int()
 			.optional()
-			.describe("Inline character budget before extracted data or sources spill to a file"),
+			.describe("Inline character budget before extracted data, sources or the URL trace spill to a file"),
 	});
 
 	return [
@@ -174,7 +231,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 			name: "firecrawl_extract",
 			label: "Firecrawl Extract",
 			description:
-				"Extract one structured JSON object from many pages at once with Firecrawl's LLM extractor. Actions: 'start' (launch a job over URLs or glob patterns like 'https://example.com/*', shaped by prompt and/or JSON Schema, optionally with web search and per-value sources) and 'status' (read a job by id). Prefer this over firecrawl_scrape's json format when the answer spans a whole site or a list of URLs; prefer firecrawl_scrape when one known page holds the data, and firecrawl_agent when the data needs multi-step navigation or interaction. Asynchronous and credit-hungry: wildcard URLs crawl and scrape every match, so scope patterns tightly. Note that Firecrawl now treats /extract as maintenance-mode — new work should usually go to firecrawl_scrape (json) or firecrawl_agent.",
+				"Extract one structured JSON object from many pages at once with Firecrawl's LLM extractor. Actions: 'start' (launch a job over up to 10 URLs or glob patterns like 'https://example.com/*', shaped by prompt and/or JSON Schema, optionally with web search and per-value sources) and 'status' (read a job by id). /extract is in maintenance mode and its status reads carry the warning \"/v2/extract/:jobId is deprecated. Use /v2/scrape with formats including a 'json' format object.\" — this tool prints that warning verbatim, and seeing it does not mean the job failed. Route new work by shape: firecrawl_scrape with a {type:'json'} format for one known page (synchronous and cheapest, but single-URL only), firecrawl_agent when the data needs navigation or lives on pages you cannot enumerate, and this tool for a fixed list of URLs or a wildcard site pattern that neither of those covers in one call. Asynchronous and credit-hungry: wildcard URLs crawl and scrape every match, so scope patterns tightly and set `limit`. Teams with zero data retention forced on cannot use /extract at all — the API rejects the request.",
 			parameters,
 			approval: "write",
 			async execute(_id, params, signal, onUpdate, _ctx) {
@@ -186,15 +243,20 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 						const snapshot = await client.request<ExtractStatusResponse>(`/extract/${encodeURIComponent(jobId)}`, {
 							signal,
 						});
-						const text = await renderExtract(out, jobId, snapshot, maxChars);
-						return snapshot.status === "failed"
-							? fail(text, { id: jobId, status: snapshot.status })
-							: ok(text, { id: jobId, status: snapshot.status, tokensUsed: snapshot.tokensUsed });
+						const collected = snapshot.next ? await client.collectPages(snapshot, { signal }) : snapshot;
+						const text = await renderExtract(out, jobId, collected, maxChars, undefined);
+						const details = {
+							id: jobId,
+							status: collected.status,
+							tokensUsed: collected.tokensUsed,
+							creditsUsed: collected.creditsUsed,
+						};
+						return collected.status === "failed" ? fail(text, details) : ok(text, details);
 					}
 
-					if (!request.urls || request.urls.length === 0) {
+					if ((request.urls === undefined || request.urls.length === 0) && !request.prompt) {
 						return fail(
-							"action:'start' requires `urls` (one or more URLs or glob patterns such as 'https://x.com/*').",
+							"action:'start' requires `urls` (one or more URLs or glob patterns such as 'https://x.com/*'), or a `prompt` alone if you want Firecrawl to find the pages itself.",
 						);
 					}
 					if (!request.prompt && !request.schema) {
@@ -214,14 +276,12 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 						);
 					}
 
-					const invalidNote =
-						started.invalidURLs && started.invalidURLs.length > 0
-							? `Ignored invalid URLs: ${started.invalidURLs.join(", ")}`
-							: "";
-
 					if (wait === false) {
 						const lines = [`Extract job started: ${id}`];
-						if (invalidNote !== "") lines.push(invalidNote);
+						if (started.invalidURLs && started.invalidURLs.length > 0) {
+							lines.push(`Ignored invalid URLs: ${started.invalidURLs.join(", ")}`);
+						}
+						if (started.warning) lines.push(`warning: ${started.warning}`);
 						lines.push(`Read it with action:'status', jobId:'${id}'.`);
 						return ok(lines.join("\n"), { id, invalidURLs: started.invalidURLs });
 					}
@@ -239,8 +299,7 @@ const module: FirecrawlToolModule = (env: FirecrawlToolEnv) => {
 					});
 
 					const collected = snapshot.next ? await client.collectPages(snapshot, { signal }) : snapshot;
-					const rendered = await renderExtract(out, id, collected, maxChars);
-					const text = invalidNote === "" ? rendered : `${invalidNote}\n\n${rendered}`;
+					const text = await renderExtract(out, id, collected, maxChars, started.invalidURLs);
 
 					if (collected.status === "failed") {
 						return fail(text, { id, status: collected.status });
