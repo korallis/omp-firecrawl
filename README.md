@@ -228,13 +228,21 @@ ignored rather than reported as an error.
 
 **Tag after publishing, not before.** Publishing from a commit and then adding
 further commits before tagging puts the tag on source that was never released.
-To check a tag really matches its published artifact:
+One command checks every published version against its tag:
 
 ```bash
-npm pack @korallis/omp-firecrawl@0.1.3 && tar -xzf korallis-omp-firecrawl-0.1.3.tgz
-git archive v0.1.3 | tar -x -C /tmp/fromgit
-diff -r package/src /tmp/fromgit/src && echo "tag matches the published artifact"
+bun run verify:tags
 ```
+
+```
+✓ 0.1.3: v0.1.3 matches the published tarball (26 files)
+i package.json is 0.1.4; npm latest is 0.1.3 — publish to close the gap
+```
+
+It pulls each version from the registry, extracts `git archive` for the
+matching tag, and compares every shipped file. It also warns when
+`package.json` names a version that is already published, which means the next
+publish would need a bump.
 
 For CI publishing, use a granular npm token scoped to `@korallis/*` with
 "bypass 2FA" enabled.
