@@ -288,10 +288,10 @@ export class FirecrawlAuthResolver {
 	 * environment, and a restricted subagent (`scout`, `librarian`, anything with
 	 * an explicit `tools:` list) gets that built-in rather than this plugin's
 	 * tools. Seeding the variable in-process is what makes those agents search
-	 * through Firecrawl too. Set `FIRECRAWL_SEED_ENV=0` to opt out.
+	 * through Firecrawl too. `config.seedEnv` (`FIRECRAWL_SEED_ENV=0`) opts out.
 	 */
 	#seed(auth: FirecrawlAuth): FirecrawlAuth {
-		if (auth.apiKey && !process.env.FIRECRAWL_API_KEY && process.env.FIRECRAWL_SEED_ENV !== "0") {
+		if (auth.apiKey && this.#config.seedEnv && !process.env.FIRECRAWL_API_KEY) {
 			process.env.FIRECRAWL_API_KEY = auth.apiKey;
 			this.#seededEnv = auth.apiKey;
 		}

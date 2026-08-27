@@ -6,7 +6,7 @@
  * never invoke `op`: a cache hit must short-circuit before the resolver would
  * reach for it, and a configured key must win over everything.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 
 import { FirecrawlAuthResolver } from "../src/core/auth.ts";
@@ -22,6 +22,9 @@ function testConfig(overrides: Partial<FirecrawlConfig> = {}): FirecrawlConfig {
 		...loadConfig(),
 		envApiKey: undefined,
 		opEnabled: false,
+		// Seeding writes process.env, which is shared with every other test file
+		// in this process. Only the two tests that assert seeding turn it on.
+		seedEnv: false,
 		opRef: "op://Test/Firecrawl/credential",
 		cacheDir: CACHE_DIR,
 		keyFilePath: KEY_PATH,
@@ -35,6 +38,13 @@ function seedCache(entry: { ref: string; key: string; fetchedAt: number }): void
 	mkdirSync(CACHE_DIR, { recursive: true });
 	writeFileSync(CACHE_PATH, JSON.stringify(entry), "utf8");
 }
+
+// Clear before as well as after: another test file in the same process can
+// leave FIRECRAWL_API_KEY behind, and resolution checks the environment first.
+beforeEach(() => {
+	rmSync(CACHE_DIR, { recursive: true, force: true });
+	delete process.env.FIRECRAWL_API_KEY;
+});
 
 afterEach(() => {
 	rmSync(CACHE_DIR, { recursive: true, force: true });
@@ -95,18 +105,16 @@ describe("FirecrawlAuthResolver", () => {
 		// A restricted subagent (scout, librarian, any agent with an explicit
 		// tools list) uses omp's built-in web_search, which reads this variable.
 		seedCache({ ref: "op://Test/Firecrawl/credential", key: "fc-seeded", fetchedAt: Date.now() });
-		await new FirecrawlAuthResolver(testConfig()).resolve();
+		await new FirecrawlAuthResolver(testConfig({ seedEnv: true })).resolve();
 
 		expect(process.env.FIRECRAWL_API_KEY).toBe("fc-seeded");
 	});
 
-	test("seeding is skipped when FIRECRAWL_SEED_ENV is 0", async () => {
-		process.env.FIRECRAWL_SEED_ENV = "0";
+	test("seeding is skipped when it is turned off", async () => {
 		seedCache({ ref: "op://Test/Firecrawl/credential", key: "fc-seeded", fetchedAt: Date.now() });
-		await new FirecrawlAuthResolver(testConfig()).resolve();
+		await new FirecrawlAuthResolver(testConfig({ seedEnv: false })).resolve();
 
 		expect(process.env.FIRECRAWL_API_KEY).toBeUndefined();
-		delete process.env.FIRECRAWL_SEED_ENV;
 	});
 
 	test("a written cache file is owner-readable only", async () => {

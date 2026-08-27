@@ -22,6 +22,13 @@ export interface FirecrawlConfig {
 	/** Whether the 1Password lookup may be attempted at all. */
 	opEnabled: boolean;
 	/**
+	 * Export a resolved key as `FIRECRAWL_API_KEY` for this process, so omp's
+	 * built-in `web_search` (what restricted subagents get) authenticates as
+	 * Firecrawl. This mutates global process state, so anything constructing
+	 * more than one resolver in a process must turn it off.
+	 */
+	seedEnv: boolean;
+	/**
 	 * How long a key read from 1Password may be reused from disk. This is what
 	 * keeps `op` (and its prompts) from running once per omp process.
 	 * Zero disables the on-disk cache.
@@ -95,6 +102,7 @@ export function loadConfig(): FirecrawlConfig {
 		keyFilePath: process.env.FIRECRAWL_KEY_FILE?.trim() || `${configDir()}/credential`,
 		opRef: process.env.FIRECRAWL_OP_REF?.trim() || "op://Dev-Env/Firecrawl/credential",
 		opEnabled: envFlag("FIRECRAWL_OP_ENABLED", true),
+		seedEnv: envFlag("FIRECRAWL_SEED_ENV", true),
 		// 12h by default: long enough that `op` runs about once a day, short
 		// enough that a rotated key is picked up without manual cleanup.
 		credentialCacheTtlMs: envInt("FIRECRAWL_CREDENTIAL_CACHE_HOURS", 12, 0, 24 * 30) * 3_600_000,

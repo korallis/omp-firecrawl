@@ -26,7 +26,14 @@ interface CapturedRequest {
 /** Build a tool environment whose transport records requests instead of sending them. */
 function harness(response: unknown): { env: FirecrawlToolEnv; requests: CapturedRequest[] } {
 	const requests: CapturedRequest[] = [];
-	const config = { ...loadConfig(), envApiKey: "fc-test", cacheDir: "/tmp/omp-firecrawl-test" };
+	// `seedEnv: false` matters: seeding writes process.env.FIRECRAWL_API_KEY,
+	// which the auth tests in this same process resolve from first.
+	const config = {
+		...loadConfig(),
+		envApiKey: "fc-test",
+		seedEnv: false,
+		cacheDir: "/tmp/omp-firecrawl-test",
+	};
 	// Only the call signature matters here; `typeof fetch` also demands `preconnect`.
 	const stubFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		requests.push({
