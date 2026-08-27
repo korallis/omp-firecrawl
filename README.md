@@ -205,18 +205,36 @@ package ships `src/`, `agents/`, `skills/`, `README.md` and `LICENSE`.
 
 ### Releasing
 
+Every step derives the version from `package.json`, so there is no placeholder
+to mistype and the tag can only ever land on the commit that was published:
+
 ```bash
-bun run check                       # must be green
-bun pm pack                         # inspect the tarball contents
-npm publish                         # publishConfig.access is already "public"
-                                    # the account has 2FA on publish: npm will
-                                    # prompt for an OTP, or use --otp=<code>.
-                                    # For CI, use a granular token scoped to
-                                    # @korallis/* with "bypass 2FA" enabled.
-git tag "v$(jq -r .version package.json)" && git push --tags
+# 1. bump version, omp.version and pi.version together, then commit
+npm version patch --no-git-tag-version   # or edit all three by hand
+jq -r '{version, omp: .omp.version, pi: .pi.version}' package.json  # must match
+git commit -am "Release v$(jq -r .version package.json)"
+
+# 2. verify, publish, tag the exact commit that shipped
+bun run check                            # must be green
+bun pm pack                              # inspect the tarball contents
+npm publish                              # 2FA: npm prompts for an OTP
+git tag "v$(jq -r .version package.json)"
+git push origin main "v$(jq -r .version package.json)"
 ```
 
-Bump `version` **and** the `omp.version` / `pi.version` mirrors in
-`package.json` together — the plugin loader overwrites the manifest version
-from the package version, so a mismatch is silently ignored rather than
-reported.
+All three version fields must move together — the plugin loader overwrites the
+manifest version from the package version, so a stale `omp.version` is silently
+ignored rather than reported as an error.
+
+**Tag after publishing, not before.** Publishing from a commit and then adding
+further commits before tagging puts the tag on source that was never released.
+To check a tag really matches its published artifact:
+
+```bash
+npm pack @korallis/omp-firecrawl@0.1.3 && tar -xzf korallis-omp-firecrawl-0.1.3.tgz
+git archive v0.1.3 | tar -x -C /tmp/fromgit
+diff -r package/src /tmp/fromgit/src && echo "tag matches the published artifact"
+```
+
+For CI publishing, use a granular npm token scoped to `@korallis/*` with
+"bypass 2FA" enabled.
