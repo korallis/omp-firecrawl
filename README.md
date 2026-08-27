@@ -168,6 +168,10 @@ package ships `src/`, `agents/`, `skills/`, `README.md` and `LICENSE`.
 bun run check                       # must be green
 bun pm pack                         # inspect the tarball contents
 npm publish                         # publishConfig.access is already "public"
+                                    # the account has 2FA on publish: npm will
+                                    # prompt for an OTP, or use --otp=<code>.
+                                    # For CI, use a granular token scoped to
+                                    # @korallis/* with "bypass 2FA" enabled.
 git tag "v$(jq -r .version package.json)" && git push --tags
 ```
 
