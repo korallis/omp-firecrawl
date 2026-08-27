@@ -1,5 +1,5 @@
 {
-  "name": "omp-firecrawl",
+  "name": "@korallis/omp-firecrawl",
   "version": "0.1.0",
   "description": "The full Firecrawl v2 API as omp/pi tools: web search, developer index, research index, scrape, map, crawl, batch, parse, extract, agent, interact, monitor and account.",
   "keywords": [

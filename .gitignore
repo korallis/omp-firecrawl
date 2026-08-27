@@ -2,3 +2,4 @@ node_modules/
 *.log
 .DS_Store
 omp-firecrawl-*.tgz
+korallis-omp-firecrawl-*.tgz

@@ -1,4 +1,4 @@
-# omp-firecrawl
+# @korallis/omp-firecrawl
 
 The whole [Firecrawl v2 API](https://docs.firecrawl.dev/api-reference/v2-introduction)
 as omp/pi tools, installed once and available in every omp instance: interactive
@@ -8,7 +8,7 @@ sessions, `omp -p`, subagents, RPC and ACP hosts.
 
 ```bash
 # from npm
-omp plugin install omp-firecrawl
+omp plugin install @korallis/omp-firecrawl
 
 # or straight from GitHub, no npm needed
 omp plugin install github:korallis/omp-firecrawl
@@ -20,7 +20,7 @@ Either form runs `bun install` in the omp plugins root
 (`~/.omp/plugins/node_modules`) and marks the plugin enabled, so its tools,
 skill and agent load in every omp instance: interactive sessions, `omp -p`,
 subagents, RPC and ACP hosts. Uninstall with
-`omp plugin uninstall omp-firecrawl`.
+`omp plugin uninstall @korallis/omp-firecrawl`.
 
 The package has **zero runtime dependencies** — the host provides the schema
 builder and the extension API, and every import of them is type-only. Nothing
@@ -30,7 +30,7 @@ Project-scoped install (this repo only, shadowing any user-level copy):
 
 ```bash
 mkdir -p .omp/plugins && cd .omp/plugins
-bun init -y >/dev/null && bun install omp-firecrawl
+bun init -y >/dev/null && bun install @korallis/omp-firecrawl
 ```
 
 Local development copy:
